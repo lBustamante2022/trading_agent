@@ -16,7 +16,7 @@ import numpy as np
 from app.green.core import Entry, Impulse, TradeResult
 from app.green.styles import GreenStyle
 from app.exchange.base import IExchange
-from app import review_setup_with_ai, AISupervisorDecision
+
 
 # ----------------------------------------------------------------------
 # DEBUG LOCAL
