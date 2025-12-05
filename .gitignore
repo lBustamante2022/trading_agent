@@ -1,0 +1,12 @@
+scripts/__pycache__/
+input/
+output/
+logs/
+_old/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+.vscode
+*.pyc
