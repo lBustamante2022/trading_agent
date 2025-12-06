@@ -75,7 +75,6 @@ class BacktestExchange(IExchange):
         self._candles_by_symbol: Dict[str, Dict[str, pd.DataFrame]] = candles_by_symbol or {}
         self._positions: Dict[str, BacktestPosition] = {}
         self._now: datetime = clock_start or datetime.utcnow()
-
     # ------------------------------------------------------------------
     # Utilidad interna: normalizar timestamp
     # ------------------------------------------------------------------

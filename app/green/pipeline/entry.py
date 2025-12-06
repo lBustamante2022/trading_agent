@@ -29,7 +29,7 @@ import pandas as pd
 
 from app.green.core import Entry, Trigger
 from app.green.styles import GreenStyle
-
+from app.ai.green_supervisor import review_setup_with_ai
 
 # ----------------------------------------------------------------------
 # DEBUG PRINT LOCAL
@@ -69,6 +69,7 @@ class DefaultEntryStrategy:
         style: GreenStyle,
         cfg: Any,
         trigger: Trigger,
+        ai_supervisor: bool = False,
     ) -> Optional[Entry]:
 
         tf = style.entry_tf
@@ -145,7 +146,7 @@ class DefaultEntryStrategy:
                     f"sl={sl:.2f}, tp={tp:.2f}, rr_min={min_rr}"
                 )
 
-            return Entry(
+            entry = Entry(
                 direction=direction,
                 timestamp=ts,
                 entry_price=entry_price,
@@ -153,6 +154,33 @@ class DefaultEntryStrategy:
                 tp=tp,
                 trigger=trigger,
             )
+
+            # ─────────────────────────────────────
+            #  🔌 Supervisión IA (último filtro)
+            # ─────────────────────────────────────
+            # 🔹 Última regla: supervisor IA (si está activado)
+            if ai_supervisor:
+                decision = review_setup_with_ai(
+                    symbol=trigger.symbol,
+                    style=style,
+                    impulse=trigger.impulse,
+                    pullback=trigger.pullback,
+                    trigger=trigger,
+                    entry=entry,
+                    dfs=dfs,
+                )
+                if not decision.approved:
+                    # Podés loggear la razón si querés
+                    print(
+                        f"[AI_SUPERVISOR] Rechazó setup en {symbol} | "
+                        f"dir={entry.direction} | motivo={decision.reason} "
+                        f"(conf={decision.confidence:.2f})"
+                    )
+                    return None
+            
+
+            # Si no usamos IA o fue aprobado, devolvemos la entry normal
+            return entry
 
         # No se encontró ninguna vela válida
         return None

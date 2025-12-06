@@ -54,7 +54,6 @@ from app.green.pipeline.trigger import DefaultTriggerStrategy
 from app.green.pipeline.entry import DefaultEntryStrategy
 from app.green.pipeline.position import DefaultPositionStrategy
 from app.exchange.okx import OkxExchange
-from app.strategies.green.types import GreenConfig   # mismas configs que backtest
 
 
 # ----------------------------------------------------------------------
@@ -181,7 +180,7 @@ def build_dfs_for_symbol(okx: OkxClient, inst_id: str, style) -> Dict[str, pd.Da
     return dfs
 
 
-def main():
+def main(ai_supervisor: bool = False):
     style_name = os.getenv("GREEN_STYLE", "DAY").upper()
     style = get_style(style_name)
 
@@ -191,24 +190,7 @@ def main():
     else:
         symbols = ["BTC/USDT"]
 
-    cfg = GreenConfig(
-        channel_width_pct=5.0,
-        pullback_sr_tolerance=0.02,
-        pullback_min_swings=2,
-        pullback_max_days=10.0,
-        trigger_min_swings=2,
-        trigger_sr_tolerance=0.05,
-        trigger_lookback_minutes=180,
-        trigger_max_break_minutes=2160,
-        entry_lookahead_minutes=60,
-        sl_buffer_pct=0.0015,
-        min_rr=2.0,
-        ema_trail_buffer_pct=0.002,
-        ema_trail_span=50,
-        # live_position_size lo podés setear en .env o acá para probar
-        # live_position_size=0.0,
-         ai_supervisor_enabled=True,   # <-- activa IA
-    )
+    cfg = style
 
     poll_seconds = int(os.getenv("GREEN_POLL_SECONDS", "300"))
 
@@ -256,6 +238,7 @@ def main():
                     dfs=dfs,
                     cfg=cfg,
                     exchange=exchange,
+                    ai_supervisor=ai_supervisor
                 )
             except Exception as e:
                 log(f"[{sym}] Error en GreenV3Core.run(): {e}")
@@ -308,4 +291,14 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="GREEN V3 LIVE")
+    parser.add_argument(
+        "--ai",
+        action="store_true",
+        help="Usar supervisor IA para validar setups antes de ejecutar órdenes",
+    )
+    args = parser.parse_args()
+
+    main(ai_supervisor=args.ai)

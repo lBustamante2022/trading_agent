@@ -128,6 +128,7 @@ class EntryStrategy(Protocol):
         trigger: Trigger,
         style: GreenStyle,
         cfg: Any,
+        ai_supervisor: bool = False,
     ) -> Optional[Entry]:
         ...
 
@@ -173,6 +174,7 @@ class GreenV3Core:
         dfs: Dict[str, pd.DataFrame],
         cfg: Any,
         exchange: IExchange,
+        ai_supervisor: bool = False
     ) -> List[TradeResult]:
         trades: List[TradeResult] = []
 
@@ -219,6 +221,7 @@ class GreenV3Core:
                         trigger=tg,
                         style=self.style,
                         cfg=cfg,
+                        ai_supervisor=ai_supervisor
                     )
                     if entry is None:
                         continue

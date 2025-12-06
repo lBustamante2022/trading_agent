@@ -3,7 +3,7 @@
 import os
 import json
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, List, Dict
 
 import pandas as pd
 from openai import OpenAI
@@ -23,42 +23,35 @@ class AISupervisorDecision:
 
 def _build_context_tf(
     df: pd.DataFrame,
-    center_ts: pd.Timestamp,
-    lookback_bars: int = 80,
-    forward_bars: int = 20,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
 ) -> List[dict]:
     """
-    Crea una ventana de velas alrededor de un timestamp de referencia.
-    No asume timeframe fijo, solo usa cantidad de velas.
+    Ventana genérica de velas entre start_ts y end_ts,
+    con campos compactos.
     """
-    if df is None or df.empty or "timestamp" not in df.columns:
+    if df is None or df.empty:
         return []
 
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    win = df[
+        (df["timestamp"] >= start_ts) &
+        (df["timestamp"] <= end_ts)
+    ].copy().sort_values("timestamp")
 
-    before = df[df["timestamp"] <= center_ts].tail(lookback_bars)
-    after = df[df["timestamp"] > center_ts].head(forward_bars)
-
-    win = pd.concat([before, after], ignore_index=True)
-    rows: List[dict] = []
-
+    rows = []
     for _, r in win.iterrows():
-        rows.append(
-            {
-                "ts": pd.to_datetime(r["timestamp"]).isoformat(),
-                "o": float(r["open"]),
-                "h": float(r["high"]),
-                "l": float(r["low"]),
-                "c": float(r["close"]),
-            }
-        )
-
+        rows.append({
+            "ts": r["timestamp"].isoformat(),
+            "o": float(r["open"]),
+            "h": float(r["high"]),
+            "l": float(r["low"]),
+            "c": float(r["close"]),
+        })
     return rows
 
 
 def review_setup_with_ai(
     symbol: str,
-    cfg: Any,                     # GreenConfig o similar
     style: GreenStyle,
     impulse: Impulse,
     pullback: Pullback,
@@ -67,81 +60,77 @@ def review_setup_with_ai(
     dfs: Dict[str, pd.DataFrame],
 ) -> AISupervisorDecision:
     """
-    Versión GREEN v3 del supervisor IA.
+    Envía un resumen del setup a OpenAI y devuelve aprobado / rechazado.
 
     Usa:
-      - TF de pullback (style.pullback_tf) para contexto 'pullback_tf'
-      - TF de trigger (style.trigger_tf) para contexto 'trigger_tf'
+      - df de pullback_tf como “contexto HTF”
+      - df de trigger_tf como “contexto LTF”
     """
 
-    # Si no hay API key, aprobamos todo (modo "apagado")
-    if not os.getenv("OPENAI_API_KEY"):
-        return AISupervisorDecision(
-            approved=True,
-            confidence=0.0,
-            reason="OPENAI_API_KEY no definido, supervisor IA desactivado.",
-        )
+    # --- elegir timeframes según el estilo ---
+    df_pullback_tf = dfs.get(style.pullback_tf)
+    df_trigger_tf = dfs.get(style.trigger_tf)
 
-    df_pb = dfs.get(style.pullback_tf)
-    df_tg = dfs.get(style.trigger_tf)
+    # Obtenemos zona del pullback desde meta (si existe)
+    zone_start = pullback.meta.get("zone_start", pullback.end_time)
+    zone_end = pullback.meta.get("zone_end", pullback.end_time)
 
+    if not isinstance(zone_start, pd.Timestamp):
+        zone_start = pd.to_datetime(zone_start)
+    if not isinstance(zone_end, pd.Timestamp):
+        zone_end = pd.to_datetime(zone_end)
+
+    # Ventana para "HTF" alrededor del pullback (ej. 40 velas antes, 10 después)
+    # No sabemos la resolución exacta, así que usamos una aproximación en horas.
     ctx_pullback = _build_context_tf(
-        df=df_pb,
-        center_ts=pullback.end_time,
-        lookback_bars=80,
-        forward_bars=20,
-    )
-    ctx_trigger = _build_context_tf(
-        df=df_tg,
-        center_ts=trigger.timestamp,
-        lookback_bars=80,
-        forward_bars=20,
-    )
+        df_pullback_tf,
+        start_ts=zone_start - pd.Timedelta(hours=40),
+        end_ts=zone_end + pd.Timedelta(hours=10),
+    ) if df_pullback_tf is not None else []
 
+    # Ventana para "LTF" alrededor del trigger
+    ctx_trigger = _build_context_tf(
+        df_trigger_tf,
+        start_ts=trigger.timestamp - pd.Timedelta(hours=6),
+        end_ts=trigger.timestamp + pd.Timedelta(hours=2),
+    ) if df_trigger_tf is not None else []
+
+    # Payload compacto con lo importante
     payload = {
         "symbol": symbol,
+        "style": style.name,
         "direction": pullback.direction,
         "sr_level": impulse.sr_level,
         "impulse_start": impulse.start.isoformat(),
         "impulse_end": impulse.end.isoformat(),
-        "pullback_end_time": pullback.end_time.isoformat(),
+        "pullback_zone_start": zone_start.isoformat(),
+        "pullback_zone_end": zone_end.isoformat(),
         "trigger_time": trigger.timestamp.isoformat(),
+        "trigger_ref_price": trigger.ref_price,
         "entry_time": entry.entry_time.isoformat(),
         "entry_sl": entry.sl,
         "entry_tp": entry.tp,
-        "cfg": {
-            # Solo algunos parámetros clave; si alguno no existe, usamos getattr con default
-            "channel_width_pct": float(getattr(cfg, "channel_width_pct", 0.0)),
-            "pullback_sr_tolerance": float(getattr(cfg, "pullback_sr_tolerance", 0.0)),
-            "pullback_min_swings": int(getattr(cfg, "pullback_min_swings", 0)),
-            "pullback_max_days": float(getattr(cfg, "pullback_max_days", 0.0)),
-            "min_rr": float(getattr(cfg, "min_rr", 0.0)),
-        },
-        "style": {
-            "name": style.name,
-            "impulse_tf": style.impulse_tf,
-            "pullback_tf": style.pullback_tf,
-            "trigger_tf": style.trigger_tf,
-            "entry_tf": style.entry_tf,
+        "params": {
+            "pullback_sr_tolerance": style.pullback_sr_tolerance,
+            "pullback_min_swings": style.pullback_min_swings,
+            "pullback_max_days": style.pullback_max_days,
+            "min_rr": style.min_rr,
         },
         "context_pullback_tf": ctx_pullback,
         "context_trigger_tf": ctx_trigger,
     }
 
     system_prompt = """
-Eres un trader profesional especializado en patrones de:
-  - impulso direccional
-  - pullback estructurado hacia un nivel de soporte/resistencia
-  - ruptura (trigger) en forma de cuña / canal diagonal.
+Eres un trader profesional especializado en patrones de impulso + pullback + ruptura diagonal (estilo cuña) en criptomonedas.
 
 Tu tarea es evaluar si un setup de trading es VÁLIDO o NO VÁLIDO según estas reglas:
 
 1) IMPULSO:
-   - Debe ser un movimiento direccional claro (no rango plano).
+   - Debe ser un movimiento direccional claro (no rango).
    - La dirección del pullback y del trigger debe ser coherente con ese impulso.
 
 2) PULLBACK VÁLIDO:
-   - Ocurre después del impulso, volviendo hacia un nivel lógico (sr_level).
+   - Ocurre después del impulso y retrocede hacia el nivel de soporte/resistencia sr_level.
    - Debe tener ESTRUCTURA, no un simple "pincho":
      - Para LONG: máximos y mínimos descendentes que se acercan al sr_level.
      - Para SHORT: máximos y mínimos ascendentes que se acercan al sr_level.
@@ -150,7 +139,7 @@ Tu tarea es evaluar si un setup de trading es VÁLIDO o NO VÁLIDO según estas 
      - Que el precio haga un nuevo máximo/mínimo que invalide la lógica del impulso.
 
 3) TRIGGER:
-   - Debe romper una diagonal del pullback cerca del final de éste.
+   - Debe romper una diagonal (cuña) del pullback cerca del final de éste.
    - Debe estar razonablemente cerca del sr_level y del "final" del pullback.
    - Debe ser coherente con la dirección del trade (no en contra).
 
@@ -173,7 +162,7 @@ No devuelvas nada más fuera de ese JSON.
         "Analiza este setup de trading de forma estricta. "
         "Solo apruébalo si el pullback realmente se parece a una cuña clara hacia sr_level "
         "y el trigger está en un punto lógico de ruptura.\n\n"
-        f"SETUP:\n```json\n{json.dumps(payload, default=str)}\n```"
+        f"SETUP:\n```json\n{json.dumps(payload)}\n```"
     )
 
     resp = client.chat.completions.create(
@@ -194,9 +183,5 @@ No devuelvas nada más fuera de ese JSON.
         reason = str(data.get("reason", ""))
         return AISupervisorDecision(approved=approved, confidence=confidence, reason=reason)
     except Exception:
-        # fallback conservador
-        return AISupervisorDecision(
-            approved=False,
-            confidence=0.0,
-            reason="Error parseando respuesta IA",
-        )
+        # fallback conservador: si algo sale mal, rechazamos
+        return AISupervisorDecision(approved=False, confidence=0.0, reason="Error parseando respuesta IA")

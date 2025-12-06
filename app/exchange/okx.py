@@ -56,7 +56,7 @@ class OkxExchange(IExchange):
         api_secret = os.getenv("OKX_API_SECRET")
         api_pass = os.getenv("OKX_API_PASS")
         flag = os.getenv("OKX_ISPAPER", "1")
-
+        
         if not api_key or not api_secret or not api_pass:
             raise RuntimeError("Faltan credenciales OKX en variables de entorno.")
 

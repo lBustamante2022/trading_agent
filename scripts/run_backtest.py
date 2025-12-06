@@ -3,7 +3,7 @@
 import os
 import argparse
 from dataclasses import asdict
-from typing import Dict
+from typing import Dict, Any
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,7 +16,6 @@ from app.green.pipeline.trigger import DefaultTriggerStrategy
 from app.green.pipeline.entry import DefaultEntryStrategy
 from app.green.pipeline.position import DefaultPositionStrategy
 from app.exchange.backtest import BacktestExchange
-from app.strategies.green.types import GreenConfig   # reutilizamos config vieja
 
 
 # ============================================================
@@ -130,10 +129,11 @@ def plot_equity_and_hist(trades_df: pd.DataFrame, symbol: str, style: GreenStyle
 def run_backtest(
     symbol: str,
     style: GreenStyle,
-    cfg: GreenConfig,
+    cfg: Any,
     data_dir: str,
     output_dir: str,
     days: int = 360,
+    ai_supervisor: bool = False
 ):
     print(f"\n========== BACKTEST {symbol} ({style.name}) ==========")
 
@@ -172,6 +172,7 @@ def run_backtest(
         dfs=dfs,
         cfg=cfg,
         exchange=exchange,
+        ai_supervisor=ai_supervisor
     )
 
     if not trades:
@@ -204,28 +205,14 @@ def main():
     parser.add_argument("--data-dir", type=str, default="input", help="Carpeta de velas (CSV)")
     parser.add_argument("--output-dir", type=str, default="output", help="Carpeta de resultados")
     parser.add_argument("--days", type=int, default=360, help="Días hacia atrás a considerar")
-
+    parser.add_argument("--ai", action="store_true", help="Usar supervisor IA para validar setups antes de simular el trade")
+    
     args = parser.parse_args()
 
     symbol = args.symbol
     style = get_style(args.style)
-
-    cfg = GreenConfig(
-        channel_width_pct=5.0,
-        pullback_sr_tolerance=0.02,
-        pullback_min_swings=2,
-        pullback_max_days=10.0,
-        trigger_min_swings=2,
-        trigger_sr_tolerance=0.05,
-        trigger_lookback_minutes=180,
-        trigger_max_break_minutes=2160,
-        entry_lookahead_minutes=60,
-        sl_buffer_pct=0.0015,
-        min_rr=2.0,
-        ema_trail_buffer_pct=0.002,
-        ema_trail_span=50,
-         ai_supervisor_enabled=True,   # <-- activa IA
-    )
+    cfg = style
+    use_ai = args.ai
 
     run_backtest(
         symbol=symbol,
@@ -234,6 +221,7 @@ def main():
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         days=args.days,
+        ai_supervisor=use_ai,
     )
 
 
