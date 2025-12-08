@@ -2,24 +2,28 @@
 """
 Detección de PULLBACK para GREEN v3 (arquitectura nueva).
 
-Idea (igual que la versión anterior, pero genérica):
+SHORT (impulso bajista desde resistencia):
+    - En el TF de pullback (style.pullback_tf) buscamos una serie
+      de swings alcistas posteriores al impulso que:
+          * terminen cerca del nivel SR del impulso
+          * tarden al menos pullback_min_hours desde el FIN del impulso
+          * estén dentro de una ventana de máximo pullback_max_days
+          * se muevan de forma LENTA / NO ACELERADA en comparación
+            con el propio impulso (velas de cuerpo más chico).
 
-    SHORT (impulso bajista desde resistencia):
-        - En el TF de pullback (style.pullback_tf) buscamos una serie
-          de swing highs:
-              * cerca del nivel SR del impulso
-              * con máximos crecientes (cuña alcista)
-              * duración mínima en horas
-              * el último swing y su cierre cerca del SR
-        → Pullback alcista agotándose contra resistencia.
+LONG (impulso alcista desde soporte):
+    - En el TF de pullback buscamos una serie de swings bajistas que:
+          * terminen cerca del SR del impulso
+          * cumplan tiempos mínimo y máximo
+          * y cuyo movimiento también sea lento vs el impulso.
 
-    LONG (impulso alcista desde soporte):
-        - En el TF de pullback buscamos swing lows:
-              * cerca del SR del impulso
-              * mínimos decrecientes (cuña bajista)
-              * duración mínima
-              * último swing + cierre cerca del SR
-        → Pullback bajista agotándose contra soporte.
+Parámetros clave (GreenStyle):
+    - pullback_sr_tolerance      (float)  → tolerancia al SR
+    - pullback_min_hours         (float)  → duración mínima (desde fin del impulso)
+    - pullback_max_days          (float)  → ventana máxima
+    - (opcional) pullback_slow_body_factor (float)
+          factor de comparación entre tamaño medio de cuerpo del pullback
+          y el del impulso. Ej: 0.6 = pullback con cuerpos ~40% más chicos.
 
 No asume timeframes fijos, toma el TF de style.pullback_tf.
 """
@@ -32,6 +36,7 @@ from typing import List, Tuple, Dict, Any
 from datetime import datetime, timedelta
 
 import builtins as _builtins
+import numpy as np
 import pandas as pd
 
 from app.green.core import PullbackStrategy, Pullback, Impulse
@@ -46,22 +51,51 @@ from app.ta.swing_points import find_swing_highs, find_swing_lows
 DEBUG_PULLBACK = False
 
 
-def _log_with_ts(*args, **kwargs):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    msg = " ".join(str(a) for a in args)
-    _builtins.print(f"[{ts}] {msg}", **kwargs)
+def _log(*args, **kwargs):
+    if DEBUG_PULLBACK:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = " ".join(str(a) for a in args)
+        _builtins.print(f"[{ts} DEBUG PULLBACK] {msg}", **kwargs)
 
 
-print = _log_with_ts  # solo afecta a este archivo
+print = _log  # override local
 
 
 def _debug_swings(label: str, swings: List[Tuple[pd.Timestamp, float]], sr: float):
-    if not DEBUG_PULLBACK:
-        return
-    print(f"[PULLBACK DEBUG] {label}: {len(swings)} swings")
-    for ts, price in swings:
-        dist = abs(price - sr) / sr
-        print(f"   - {ts}  price={price:.2f}  dist={dist:.4f}")
+    if DEBUG_PULLBACK:
+        print(f"{label}: {len(swings)} swings")
+        for ts, price in swings:
+            dist = abs(price - sr) / sr
+            print(f"   - {ts}  price={price:.2f}  dist_sr={dist:.4f}")
+
+
+# ----------------------------------------------------------------------
+# Helper: tamaño medio de cuerpo en % (|close-open| / |close|)
+# ----------------------------------------------------------------------
+
+def _avg_body_pct(df: pd.DataFrame) -> float | None:
+    """
+    Devuelve el tamaño medio del cuerpo de las velas en términos relativos:
+
+        body_pct = |close - open| / |close|
+
+    Ignora filas con close=0 o NaN. Si no hay datos válidos, devuelve None.
+    """
+    if df is None or df.empty:
+        return None
+    if "open" not in df.columns or "close" not in df.columns:
+        return None
+
+    closes = df["close"].astype(float)
+    opens = df["open"].astype(float)
+
+    body = (closes - opens).abs()
+    denom = closes.abs().replace(0, np.nan)
+
+    pct = (body / denom).replace([np.inf, -np.inf], np.nan).dropna()
+    if pct.empty:
+        return None
+    return float(pct.mean())
 
 
 # ----------------------------------------------------------------------
@@ -71,27 +105,28 @@ def _debug_swings(label: str, swings: List[Tuple[pd.Timestamp, float]], sr: floa
 @dataclass
 class DefaultPullbackStrategy(PullbackStrategy):
     """
-    Estrategia genérica de pullback en cuña contra SR.
+    Estrategia genérica de pullback contra SR, sin validar cuña geométrica.
 
-    Parámetros usados:
+    Parametría tomada del estilo (GreenStyle):
 
-      De cfg:
-        - pullback_min_swings (int)
-        - pullback_max_days (float)
-        - pullback_sr_tolerance (float)  ej: 0.02 = 2%
+        pullback_sr_tolerance      (float)
+        pullback_min_hours         (float)
+        pullback_max_days          (float)
 
-      Del style:
-        - pullback_tf (str)
-        - pullback_min_hours (float, opcional; default 12h)
+    Adicional (opcional, también en GreenStyle si querés):
+        pullback_slow_body_factor  (float, default 0.6)
 
-    Devuelve: lista de Pullback (en esta versión, 0 o 1 por impulso).
+    Idea:
+        - El pullback debe ser "lento" vs el impulso:
+            avg_body_pct_pullback <= pullback_slow_body_factor * avg_body_pct_impulse
     """
 
     def detect_pullbacks(
         self,
+        symbol: str,
         dfs: Dict[str, pd.DataFrame],
         style: GreenStyle,
-        cfg: Any,
+        cfg: Any,          # se mantiene en la firma por compatibilidad
         impulse: Impulse,
     ) -> List[Pullback]:
 
@@ -106,11 +141,11 @@ class DefaultPullbackStrategy(PullbackStrategy):
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         # --------------------------------------------------------------
-        # Ventana temporal después del impulso
+        # Ventana temporal después del impulso: desde FIN del impulso
         # --------------------------------------------------------------
-        max_days = float(getattr(cfg, "pullback_max_days", 10.0))
-        start_ts = impulse.start
-        end_ts = impulse.start + timedelta(days=max_days)
+        max_days = float(style.pullback_max_days)
+        start_ts = impulse.end
+        end_ts = impulse.end + timedelta(days=max_days)
 
         df_win = df[
             (df["timestamp"] > start_ts) &
@@ -118,209 +153,228 @@ class DefaultPullbackStrategy(PullbackStrategy):
         ].copy()
 
         if df_win.empty:
-            if DEBUG_PULLBACK:
-                print(f"[PULLBACK DEBUG] ventana vacía ({start_ts} → {end_ts})")
+            print(f"[{symbol}] ventana vacía pullback ({start_ts} → {end_ts})")
             return []
 
         sr_level = float(impulse.sr_level)
         direction = impulse.direction
 
-        min_swings = max(2, int(getattr(cfg, "pullback_min_swings", 2)))
-        tol = float(getattr(cfg, "pullback_sr_tolerance", 0.02))     # tolerancia base al SR
-        close_tol = tol * 1.5                                        # un poco más para el cierre
+        # Parámetros de estilo
+        tol_sr = float(style.pullback_sr_tolerance)
+        min_hours = float(style.pullback_min_hours)
+        slow_factor = float(getattr(style, "pullback_slow_body_factor", 0.6))
 
-        min_hours = float(getattr(style, "pullback_min_hours", 12.0))
+        # --------------------------------------------------------------
+        # Cálculo de "velocidad" del impulso (tamaño medio de velas)
+        # --------------------------------------------------------------
+        impulse_tf = style.impulse_tf
+        df_impulse_tf = dfs.get(impulse_tf)
+        avg_body_impulse_pct: float | None = None
 
-        if DEBUG_PULLBACK:
-            print(
-                f"[PULLBACK DEBUG] dir={direction}, tf={tf}, "
-                f"min_swings={min_swings}, max_days={max_days}, "
-                f"tol={tol:.3f}, close_tol={close_tol:.3f}, "
-                f"sr_level={sr_level:.2f}, min_hours={min_hours:.1f}"
+        if df_impulse_tf is not None and not df_impulse_tf.empty:
+            df_imp_seg = df_impulse_tf[
+                (df_impulse_tf["timestamp"] >= impulse.start) &
+                (df_impulse_tf["timestamp"] <= impulse.end)
+            ].copy()
+            avg_body_impulse_pct = _avg_body_pct(df_imp_seg)
+
+        # Fallback: si no pudimos medir el impulso, usamos el parámetro
+        # impulse_min_body_pct como referencia para "velas grandes".
+        if avg_body_impulse_pct is None:
+            avg_body_impulse_pct = float(
+                getattr(style, "impulse_min_body_pct", 0.02)
             )
+
+        print(
+            f"[{symbol} PULLBACK] dir={direction}, tf={tf}, "
+            f"max_days={max_days}, sr_tol={tol_sr:.4f}, "
+            f"min_hours={min_hours:.1f}, slow_factor={slow_factor:.2f}, "
+            f"sr_level={sr_level:.2f}, avg_body_impulse={avg_body_impulse_pct:.4f}"
+        )
 
         # --------------------------------------------------------------
         # SHORT → pullback alcista contra resistencia (swing highs)
         # --------------------------------------------------------------
         if direction == "short":
             highs = df_win["high"].to_numpy()
-            idx_sw = find_swing_highs(highs)
+            idx_sw = find_swing_highs(
+                highs,
+                # left=2,
+                # right=2,
+                # min_prominence_pct=0.004,
+                # min_separation=10,
+            )
+            # idx_sw = []
+            # for i in range(1, len(highs) - 1):
+            #     idx_sw.append(i)
 
-            if len(idx_sw) < min_swings:
-                return []
-
+            # Swings con distancia al SR
             swings_all: List[Tuple[pd.Timestamp, float, float]] = []
             for idx in idx_sw:
                 ts = df_win["timestamp"].iloc[idx]
                 price = float(highs[idx])
-                dist = abs(price - sr_level) / sr_level
-                swings_all.append((ts, price, dist))
+                dist_sr = abs(price - sr_level) / sr_level
+                swings_all.append((ts, price, dist_sr))
 
-            swings_near = [(ts, p, d) for (ts, p, d) in swings_all if d <= tol * 2.0]
-            if len(swings_near) < min_swings:
-                return []
+            # Recorremos swings en orden; cuando un swing entra en SR,
+            # validamos: tiempo, cercanía y "lenteza" del movimiento.
+            for i in range(len(swings_all)):
+                last_ts, last_price, last_dist = swings_all[i]
 
-            swings_near.sort(key=lambda x: x[0])
-
-            chosen_core = None
-            chosen_close = None
-            chosen_close_dist = None
-
-            for i in range(0, len(swings_near) - min_swings + 1):
-                candidate = swings_near[i : i + min_swings]
-                prices = [p for (_, p, _) in candidate]
-
-                # Cuña alcista: máximos crecientes (permitimos leve ruido)
-                asc_ok = all(prices[j] >= prices[j - 1] * 0.995 for j in range(1, len(prices)))
-                if not asc_ok:
+                # 1) ¿Llegamos a la zona SR?
+                if last_dist > tol_sr:
                     continue
 
-                # Duración mínima
-                first_ts = candidate[0][0]
-                last_ts = candidate[-1][0]
-                duration_h = (last_ts - first_ts).total_seconds() / 3600.0
+                # Swings usados: desde el primero hasta este
+                candidate_swings = swings_all[: i + 1]
+                swings_core_ts_prices: List[Tuple[pd.Timestamp, float]] = [
+                    (ts, price) for (ts, price, _) in candidate_swings
+                ]
+
+                # 2) Duración mínima desde fin del impulso
+                duration_h = (last_ts - impulse.end).total_seconds() / 3600.0
                 if duration_h < min_hours:
-                    if DEBUG_PULLBACK:
-                        print(
-                            f"[PULLBACK DEBUG] SHORT candidato muy corto: "
-                            f"{duration_h:.1f}h < {min_hours:.1f}h → descarto"
-                        )
+                    print(
+                        f"[{symbol} SHORT] candidato muy corto (desde fin impulso): "
+                        f"{duration_h:.1f}h < {min_hours:.1f}h → descarto"
+                    )
                     continue
 
-                # Último swing y cierre cerca del SR
-                last_ts, last_price, last_dist = candidate[-1]
+                # 3) Cierre cerca del SR en el último swing
                 pb_row = df_win[df_win["timestamp"] == last_ts]
                 if pb_row.empty:
                     continue
-
                 pb_close = float(pb_row["close"].iloc[0])
                 dist_close = abs(pb_close - sr_level) / sr_level
-
-                if max(last_dist, dist_close) > close_tol:
+                if dist_close > tol_sr:
                     continue
 
-                chosen_core = candidate
-                chosen_close = pb_close
-                chosen_close_dist = dist_close
-                break
+                # 4) LENTEZA del pullback: cuerpos más chicos que el impulso
+                df_pb_seg = df_win[
+                    (df_win["timestamp"] > impulse.end) &
+                    (df_win["timestamp"] <= last_ts)
+                ].copy()
+                avg_body_pb_pct = _avg_body_pct(df_pb_seg)
 
-            if chosen_core is None:
-                return []
+                if avg_body_pb_pct is None:
+                    # si no podemos medir, por seguridad descartamos el candidato
+                    print(f"[{symbol} SHORT] no pude medir cuerpo del pullback → descarto")
+                    continue
 
-            swings_core = chosen_core
-            pb_close = chosen_close
-            dist_close = chosen_close_dist
+                # condición de "pullback lento"
+                max_allowed_pb = slow_factor * avg_body_impulse_pct
+                if avg_body_pb_pct > max_allowed_pb:
+                    print(
+                        f"[{symbol} SHORT] pullback demasiado rápido: "
+                        f"avg_body_pb={avg_body_pb_pct:.4f} > "
+                        f"slow_factor * avg_body_impulse={max_allowed_pb:.4f} → descarto"
+                    )
+                    continue
 
-            swings_core_ts_prices: List[Tuple[pd.Timestamp, float]] = [
-                (ts, price) for (ts, price, _) in swings_core
-            ]
+                # OK → Pullback válido
+                _debug_swings(f"{symbol} SHORT swings_core", swings_core_ts_prices, sr_level)
 
-            if DEBUG_PULLBACK:
-                _debug_swings("SHORT swings_core", swings_core_ts_prices, sr_level)
+                pb = Pullback(
+                    symbol=symbol,
+                    direction=direction,
+                    impulse=impulse,
+                    # swings=swings_core_ts_prices,
+                    start=start_ts,
+                    end=last_ts,
+                    end_close=pb_close
+                )
+                return [pb]
 
-            last_ts, _, _ = swings_core[-1]
-            pb_end_ts = last_ts
-
-            pb = Pullback(
-                direction=direction,
-                impulse=impulse,
-                swings=swings_core_ts_prices,
-                end_ts=pb_end_ts,
-                close=pb_close,
-                dist_to_sr_pct=dist_close,
-            )
-            return [pb]
+            # Ningún candidato válido
+            return []
 
         # --------------------------------------------------------------
         # LONG → pullback bajista contra soporte (swing lows)
         # --------------------------------------------------------------
         elif direction == "long":
             lows = df_win["low"].to_numpy()
-            idx_sw = find_swing_lows(lows)
-
-            if len(idx_sw) < min_swings:
-                return []
+            idx_sw = find_swing_lows(
+                lows,
+                # left=2,
+                # right=2,
+                # min_prominence_pct=0.004,
+                # min_separation=10,
+            )
+            # idx_sw = []
+            # for i in range(1, len(lows) - 1):
+            #     idx_sw.append(i)
 
             swings_all: List[Tuple[pd.Timestamp, float, float]] = []
             for idx in idx_sw:
                 ts = df_win["timestamp"].iloc[idx]
                 price = float(lows[idx])
-                dist = abs(price - sr_level) / sr_level
-                swings_all.append((ts, price, dist))
+                dist_sr = abs(price - sr_level) / sr_level
+                swings_all.append((ts, price, dist_sr))
 
-            swings_near = [(ts, p, d) for (ts, p, d) in swings_all if d <= tol * 2.0]
-            if len(swings_near) < min_swings:
-                return []
+            for i in range(len(swings_all)):
+                last_ts, last_price, last_dist = swings_all[i]
 
-            swings_near.sort(key=lambda x: x[0])
-
-            chosen_core = None
-            chosen_close = None
-            chosen_close_dist = None
-
-            for i in range(0, len(swings_near) - min_swings + 1):
-                candidate = swings_near[i : i + min_swings]
-                prices = [p for (_, p, _) in candidate]
-
-                # Cuña bajista: mínimos decrecientes (permitimos leve ruido)
-                desc_ok = all(prices[j] <= prices[j - 1] * 1.005 for j in range(1, len(prices)))
-                if not desc_ok:
+                # 1) Llegada a zona SR
+                if last_dist > tol_sr:
                     continue
 
-                # Duración mínima
-                first_ts = candidate[0][0]
-                last_ts = candidate[-1][0]
-                duration_h = (last_ts - first_ts).total_seconds() / 3600.0
+                candidate_swings = swings_all[: i + 1]
+                swings_core_ts_prices: List[Tuple[pd.Timestamp, float]] = [
+                    (ts, price) for (ts, price, _) in candidate_swings
+                ]
+
+                # 2) Duración mínima desde fin del impulso
+                duration_h = (last_ts - impulse.end).total_seconds() / 3600.0
                 if duration_h < min_hours:
-                    if DEBUG_PULLBACK:
-                        print(
-                            f"[PULLBACK DEBUG] LONG candidato muy corto: "
-                            f"{duration_h:.1f}h < {min_hours:.1f}h → descarto"
-                        )
+                    print(
+                        f"[{symbol} LONG] candidato muy corto (desde fin impulso): "
+                        f"{duration_h:.1f}h < {min_hours:.1f}h → descarto"
+                    )
                     continue
 
-                last_ts, last_price, last_dist = candidate[-1]
+                # 3) Cierre cerca de SR
                 pb_row = df_win[df_win["timestamp"] == last_ts]
                 if pb_row.empty:
                     continue
-
                 pb_close = float(pb_row["close"].iloc[0])
                 dist_close = abs(pb_close - sr_level) / sr_level
-
-                if max(last_dist, dist_close) > close_tol:
+                if dist_close > tol_sr:
                     continue
 
-                chosen_core = candidate
-                chosen_close = pb_close
-                chosen_close_dist = dist_close
-                break
+                # 4) LENTEZA del pullback bajista
+                df_pb_seg = df_win[
+                    (df_win["timestamp"] > impulse.end) &
+                    (df_win["timestamp"] <= last_ts)
+                ].copy()
+                avg_body_pb_pct = _avg_body_pct(df_pb_seg)
 
-            if chosen_core is None:
-                return []
+                if avg_body_pb_pct is None:
+                    print(f"[{symbol} LONG] no pude medir cuerpo del pullback → descarto")
+                    continue
 
-            swings_core = chosen_core
-            pb_close = chosen_close
-            dist_close = chosen_close_dist
+                max_allowed_pb = slow_factor * avg_body_impulse_pct
+                if avg_body_pb_pct > max_allowed_pb:
+                    print(
+                        f"[{symbol} LONG] pullback demasiado rápido: "
+                        f"avg_body_pb={avg_body_pb_pct:.4f} > "
+                        f"slow_factor * avg_body_impulse={max_allowed_pb:.4f} → descarto"
+                    )
+                    continue
 
-            swings_core_ts_prices: List[Tuple[pd.Timestamp, float]] = [
-                (ts, price) for (ts, price, _) in swings_core
-            ]
+                _debug_swings(f"{symbol} LONG swings_core", swings_core_ts_prices, sr_level)
 
-            if DEBUG_PULLBACK:
-                _debug_swings("LONG swings_core", swings_core_ts_prices, sr_level)
+                pb = Pullback(
+                    symbol=symbol,
+                    direction=direction,
+                    impulse=impulse,
+                    # swings=swings_core_ts_prices,
+                    start=start_ts,
+                    end=last_ts,
+                    end_close=pb_close
+                )
+                return [pb]
 
-            last_ts, _, _ = swings_core[-1]
-            pb_end_ts = last_ts
-
-            pb = Pullback(
-                direction=direction,
-                impulse=impulse,
-                swings=swings_core_ts_prices,
-                end_ts=pb_end_ts,
-                close=pb_close,
-                dist_to_sr_pct=dist_close,
-            )
-            return [pb]
+            return []
 
         # Dirección rara → sin pullbacks
         return []

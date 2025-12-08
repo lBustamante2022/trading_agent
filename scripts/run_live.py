@@ -12,35 +12,8 @@ from typing import Dict
 
 import httpx
 import pandas as pd
+import app.ta.environment
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-ENV_PATH = os.path.join(BASE_DIR, ".env")
-
-
-def load_env_file(path: str):
-    if not os.path.exists(path):
-        print(f"[ENV] Archivo .env no encontrado en: {path}")
-        return
-    try:
-        with open(path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                key = key.strip()
-                val = val.split("#", 1)[0]
-                val = val.strip().replace('"', "").replace("'", "")
-                os.environ[key] = val
-        print(f"[ENV] Variables cargadas desde {path}")
-    except Exception as e:
-        print(f"[ENV] Error cargando .env: {e}")
-
-
-load_env_file(ENV_PATH)
-sys.path.append(BASE_DIR)
 
 # ----------------------------------------------------------------------
 # Imports GREEN V3
@@ -203,8 +176,8 @@ def main(ai_supervisor: bool = False):
     impulse_strategy = DefaultImpulseStrategy()
     pullback_strategy = DefaultPullbackStrategy()
     trigger_strategy = DefaultTriggerStrategy()
-    entry_strategy = DefaultEntryStrategy()
-    position_strategy = DefaultPositionStrategy()
+    entry_strategy = DefaultEntryStrategy(ai_supervisor=ai_supervisor)
+    position_strategy = DefaultPositionStrategy(exchange=exchange)
 
     stages = GreenStages(
         impulse=impulse_strategy,
@@ -237,8 +210,6 @@ def main(ai_supervisor: bool = False):
                     symbol=sym,
                     dfs=dfs,
                     cfg=cfg,
-                    exchange=exchange,
-                    ai_supervisor=ai_supervisor
                 )
             except Exception as e:
                 log(f"[{sym}] Error en GreenV3Core.run(): {e}")

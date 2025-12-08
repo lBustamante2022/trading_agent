@@ -12,7 +12,7 @@ from app.green.core import Impulse, Pullback, Trigger, Entry
 from app.green.styles import GreenStyle
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+model = os.getenv("OPENAI_MODEL")
 
 @dataclass
 class AISupervisorDecision:
@@ -72,8 +72,10 @@ def review_setup_with_ai(
     df_trigger_tf = dfs.get(style.trigger_tf)
 
     # Obtenemos zona del pullback desde meta (si existe)
-    zone_start = pullback.meta.get("zone_start", pullback.end_time)
-    zone_end = pullback.meta.get("zone_end", pullback.end_time)
+    # zone_start = pullback.meta.get("zone_start", pullback.end_time)
+    # zone_end = pullback.meta.get("zone_end", pullback.end_time)
+    zone_start = impulse.end
+    zone_end = pullback.end
 
     if not isinstance(zone_start, pd.Timestamp):
         zone_start = pd.to_datetime(zone_start)
@@ -91,8 +93,8 @@ def review_setup_with_ai(
     # Ventana para "LTF" alrededor del trigger
     ctx_trigger = _build_context_tf(
         df_trigger_tf,
-        start_ts=trigger.timestamp - pd.Timedelta(hours=6),
-        end_ts=trigger.timestamp + pd.Timedelta(hours=2),
+        start_ts=trigger.end - pd.Timedelta(hours=6),
+        end_ts=trigger.end + pd.Timedelta(hours=2),
     ) if df_trigger_tf is not None else []
 
     # Payload compacto con lo importante
@@ -105,47 +107,66 @@ def review_setup_with_ai(
         "impulse_end": impulse.end.isoformat(),
         "pullback_zone_start": zone_start.isoformat(),
         "pullback_zone_end": zone_end.isoformat(),
-        "trigger_time": trigger.timestamp.isoformat(),
-        "trigger_ref_price": trigger.ref_price,
-        "entry_time": entry.entry_time.isoformat(),
+        "trigger_time": trigger.end.isoformat(),
+        "trigger_ref_price": trigger.end_close,
+        "entry_time": entry.end.isoformat(),
         "entry_sl": entry.sl,
         "entry_tp": entry.tp,
         "params": {
             "pullback_sr_tolerance": style.pullback_sr_tolerance,
-            "pullback_min_swings": style.pullback_min_swings,
             "pullback_max_days": style.pullback_max_days,
-            "min_rr": style.min_rr,
+            "min_rr": style.entry_min_rr,
         },
         "context_pullback_tf": ctx_pullback,
         "context_trigger_tf": ctx_trigger,
     }
 
     system_prompt = """
-Eres un trader profesional especializado en patrones de impulso + pullback + ruptura diagonal (estilo cuña) en criptomonedas.
+Eres un trader profesional especializado en patrones de impulso + pullback + ruptura en criptomonedas.
 
-Tu tarea es evaluar si un setup de trading es VÁLIDO o NO VÁLIDO según estas reglas:
+MUY IMPORTANTE:
+- El motor GREEN ya hizo el filtrado técnico fuerte de:
+  - impulso
+  - pullback
+  - trigger
+  - entry
+- Tu tarea NO es buscar la perfección, sino detectar setups claramente malos o incoherentes.
+- Si el setup es razonable, aunque no sea perfecto, DEBES aprobarlo (con la confianza que corresponda).
+
+Ten en cuenta lo siguiente:
 
 1) IMPULSO:
-   - Debe ser un movimiento direccional claro (no rango).
-   - La dirección del pullback y del trigger debe ser coherente con ese impulso.
+   - Asume que ya fue validado por el sistema.
+   - Aunque impulse_start e impulse_end puedan ser iguales o parecidos en el payload, NO uses eso como motivo principal de rechazo.
+   - Solo marca el impulso como problema si el contexto de precio muestra claramente un rango sin dirección o una estructura totalmente opuesta a la dirección del trade.
 
-2) PULLBACK VÁLIDO:
-   - Ocurre después del impulso y retrocede hacia el nivel de soporte/resistencia sr_level.
-   - Debe tener ESTRUCTURA, no un simple "pincho":
-     - Para LONG: máximos y mínimos descendentes que se acercan al sr_level.
-     - Para SHORT: máximos y mínimos ascendentes que se acercan al sr_level.
-   - Debe evitar:
-     - Rebote en V sin estructura.
-     - Que el precio haga un nuevo máximo/mínimo que invalide la lógica del impulso.
+2) PULLBACK:
+   - Debe retroceder hacia el nivel de soporte/resistencia sr_level.
+   - Debe tener cierta estructura (no un simple "pincho" en una sola vela gigantesca).
+   - Es válido que no sea una cuña perfecta.
+   - Lo que buscamos penalizar es:
+     - Pullbacks excesivamente verticales (muy rápidos, sin complejidad).
+     - Pullbacks que superan claramente el sr_level y lo invalidan.
 
 3) TRIGGER:
-   - Debe romper una diagonal (cuña) del pullback cerca del final de éste.
-   - Debe estar razonablemente cerca del sr_level y del "final" del pullback.
-   - Debe ser coherente con la dirección del trade (no en contra).
+   - Debe aparecer cerca del final del pullback y en coherencia con la dirección del trade.
+   - No necesitas ver una cuña diagonal perfecta; basta con que el trigger tenga sentido como ruptura de agotamiento del pullback.
 
 4) ENTRY:
-   - Debe estar próximo en el tiempo al trigger (pocas velas después).
-   - SL y TP deben tener sentido con la estructura del impulso y el pullback.
+   - Debe estar relativamente cerca en el tiempo del trigger.
+   - SL y TP deben tener sentido con el tamaño del pullback y el nivel sr_level.
+   - Si el RR (rr) es muy bajo o el SL está claramente mal ubicado (ej. por encima de la entrada en un long), puedes rechazar.
+
+CRITERIO DE DECISIÓN:
+
+- Usa RECHAZO solo para setups claramente malos:
+  - impulso totalmente plano o en contra.
+  - pullback demasiado vertical sin estructura.
+  - trigger muy lejos del final del pullback o en la dirección equivocada.
+  - SL/TP absurdos (ej: SL del lado equivocado del trade).
+
+- Si el setup es aceptable o simplemente “no estás seguro”, APRUÉBALO.
+  - En esos casos, refleja la duda en el campo "confidence" (por ejemplo 0.5 o 0.6).
 
 Debes devolver SIEMPRE un JSON EXACTO con este formato:
 
@@ -159,14 +180,17 @@ No devuelvas nada más fuera de ese JSON.
 """
 
     user_prompt = (
-        "Analiza este setup de trading de forma estricta. "
-        "Solo apruébalo si el pullback realmente se parece a una cuña clara hacia sr_level "
-        "y el trigger está en un punto lógico de ruptura.\n\n"
+        "Analiza este setup de trading dentro del contexto de impulso + pullback + trigger + entry "
+        "que ya fueron filtrados por el motor GREEN.\n\n"
+        "Recuerda:\n"
+        "- Tu rol es ser un filtro SUAVE: solo rechaza setups claramente defectuosos.\n"
+        "- Si el setup es razonable o solo leves dudas, apruébalo y usa un nivel de confidence acorde.\n"
+        "- NO rechaces solo porque impulse_start e impulse_end sean iguales o porque la cuña no sea perfecta.\n\n"
         f"SETUP:\n```json\n{json.dumps(payload)}\n```"
     )
 
     resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model=model,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},

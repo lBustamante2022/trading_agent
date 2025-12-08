@@ -19,12 +19,20 @@ Idea simplificada y genérica:
           cfg.trigger_sr_tolerance (porcentaje sobre sr_level)
 
     LONG  (impulso alcista desde soporte):
-        buscamos la PRIMER vela cuyo close
-          > pb.close + sr_level * tol
+        - buscamos la PRIMER vela cuyo close
+              > pb.close + sr_level * tol
+        - si en el camino el precio ROMPE el soporte por debajo de
+          sr_level - sr_level * break_tol  → setup INVALIDADO.
 
     SHORT (impulso bajista desde resistencia):
-        buscamos la PRIMER vela cuyo close
-          < pb.close - sr_level * tol
+        - buscamos la PRIMER vela cuyo close
+              < pb.close - sr_level * tol
+        - si en el camino el precio ROMPE la resistencia por encima de
+          sr_level + sr_level * break_tol → setup INVALIDADO.
+
+Parámetros de invalidación (tomados del estilo GreenStyle):
+    - pullback_min_tolerance (float)  → tolerancia extra para ruptura del SR
+      (si no existe, se usa pullback_sr_tolerance como fallback).
 
 Devuelve: lista de Trigger (en esta versión, 0 o 1 por pullback).
 """
@@ -49,14 +57,13 @@ from app.green.styles import GreenStyle
 
 DEBUG_TRIGGER = False
 
+def _log(*args, **kwargs):
+    if DEBUG_TRIGGER:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = " ".join(str(a) for a in args)
+        _builtins.print(f"[{ts} DEBUG TRIGGER] {msg}", **kwargs)
 
-def _log_with_ts(*args, **kwargs):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    msg = " ".join(str(a) for a in args)
-    _builtins.print(f"[{ts}] {msg}", **kwargs)
-
-
-print = _log_with_ts  # solo en este archivo
+print = _log  # override local
 
 
 # ----------------------------------------------------------------------
@@ -76,12 +83,15 @@ class DefaultTriggerStrategy(TriggerStrategy):
 
       Del style:
         - trigger_tf (str)
+        - pullback_min_tolerance (float, opcional)
+        - pullback_sr_tolerance (float, fallback si no hay min_tolerance)
 
     No asume timeframes fijos.
     """
 
     def detect_triggers(
         self,
+        symbol: str,
         dfs: Dict[str, pd.DataFrame],
         style: GreenStyle,
         cfg: Any,
@@ -100,11 +110,20 @@ class DefaultTriggerStrategy(TriggerStrategy):
 
         direction = pullback.direction       # "long" / "short" (misma que el impulso)
         sr_level = float(pullback.impulse.sr_level)
-        pb_end_ts = pullback.end_ts
-        pb_close = float(pullback.close)
+        pb_end_ts = pullback.end
+        pb_close = float(pullback.end_close)
 
         tol = float(getattr(cfg, "trigger_sr_tolerance", 0.05))
         max_minutes = int(getattr(cfg, "trigger_max_break_minutes", 36 * 60))
+
+        # Tolerancia de INVALIDACIÓN del setup si se rompe el SR en contra
+        break_tol = float(
+            getattr(
+                style,
+                "pullback_min_tolerance",
+                getattr(style, "pullback_sr_tolerance", tol),
+            )
+        )
 
         start_ts = pb_end_ts
         end_ts = pb_end_ts + timedelta(minutes=max_minutes)
@@ -115,20 +134,18 @@ class DefaultTriggerStrategy(TriggerStrategy):
         ].copy()
 
         if df_win.empty:
-            if DEBUG_TRIGGER:
-                print(
-                    f"[TRIGGER DEBUG] ventana vacía ({start_ts} → {end_ts}) "
-                    f"para TF {tf}"
-                )
+            print(
+                f"ventana vacía ({start_ts} → {end_ts}) "
+                f"para TF {tf}"
+            )
             return []
 
-        if DEBUG_TRIGGER:
-            print(
-                f"[TRIGGER DEBUG] dir={direction}, tf={tf}, "
-                f"pb_end={pb_end_ts}, sr_level={sr_level:.2f}, "
-                f"pb_close={pb_close:.2f}, tol={tol:.3f}, "
-                f"max_minutes={max_minutes}"
-            )
+        print(
+            f"dir={direction}, tf={tf}, "
+            f"pb_end={pb_end_ts}, sr_level={sr_level:.2f}, "
+            f"pb_close={pb_close:.2f}, tol={tol:.3f}, "
+            f"break_tol={break_tol:.4f}, max_minutes={max_minutes}"
+        )
 
         triggers: List[Trigger] = []
 
@@ -143,19 +160,31 @@ class DefaultTriggerStrategy(TriggerStrategy):
                 ts = row["timestamp"]
                 close = float(row["close"])
 
+                # 1) INVALIDACIÓN: ¿rompió el SOPORTE demasiado hacia abajo?
+                #    Si (sr_level - close) / sr_level > break_tol → descartar setup.
+                dist_break = (sr_level - close) / sr_level
+                if dist_break > break_tol:
+                    print(
+                        f"LONG invalidado: ts={ts}, close={close:.2f} "
+                        f"rompe soporte más allá de tolerancia "
+                        f"(dist_break={dist_break:.4f} > break_tol={break_tol:.4f})"
+                    )
+                    return []
+
+                # 2) Trigger válido: ruptura alcista
                 if close > threshold:
-                    if DEBUG_TRIGGER:
-                        print(
-                            f"[TRIGGER DEBUG] LONG break: ts={ts}, "
-                            f"close={close:.2f} > thr={threshold:.2f}"
-                        )
+                    print(
+                        f"LONG break: ts={ts}, "
+                        f"close={close:.2f} > thr={threshold:.2f}"
+                    )
 
                     tr = Trigger(
+                        symbol=symbol,
                         direction="long",
-                        timestamp=ts,
+                        start=start_ts,
+                        end=ts,
                         pullback=pullback,
-                        sr_level=sr_level,
-                        ref_price=pb_close,
+                        end_close=pb_close,
                     )
                     triggers.append(tr)
                     break  # sólo el primero
@@ -170,19 +199,31 @@ class DefaultTriggerStrategy(TriggerStrategy):
                 ts = row["timestamp"]
                 close = float(row["close"])
 
+                # 1) INVALIDACIÓN: ¿rompió la RESISTENCIA demasiado hacia arriba?
+                #    Si (close - sr_level) / sr_level > break_tol → descartar setup.
+                dist_break = (close - sr_level) / sr_level
+                if dist_break > break_tol:
+                    print(
+                        f"SHORT invalidado: ts={ts}, close={close:.2f} "
+                        f"rompe resistencia más allá de tolerancia "
+                        f"(dist_break={dist_break:.4f} > break_tol={break_tol:.4f})"
+                    )
+                    return []
+
+                # 2) Trigger válido: ruptura bajista
                 if close < threshold:
-                    if DEBUG_TRIGGER:
-                        print(
-                            f"[TRIGGER DEBUG] SHORT break: ts={ts}, "
-                            f"close={close:.2f} < thr={threshold:.2f}"
-                        )
+                    print(
+                        f"SHORT break: ts={ts}, "
+                        f"close={close:.2f} < thr={threshold:.2f}"
+                    )
 
                     tr = Trigger(
+                        symbol=symbol,
                         direction="short",
-                        timestamp=ts,
+                        start=start_ts,
+                        end=ts,
                         pullback=pullback,
-                        sr_level=sr_level,
-                        ref_price=pb_close,
+                        end_close=pb_close,
                     )
                     triggers.append(tr)
                     break  # sólo el primero

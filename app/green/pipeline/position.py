@@ -61,7 +61,7 @@ def _simulate_position(
     ema_trail_buffer_pct: float,
     ema_span: int,
     max_holding_minutes: int,
-    exchange: Optional[IExchange] = None,
+    exchange: IExchange,
     position_id: Optional[str] = None,
 ) -> Optional[PositionResult]:
     if df_price is None or df_price.empty:
@@ -276,6 +276,7 @@ def _simulate_position(
 
 @dataclass
 class DefaultPositionStrategy:
+    exchange: IExchange
     """
     Estrategia de posición genérica para GREEN V3.
 
@@ -288,7 +289,12 @@ class DefaultPositionStrategy:
         - cfg.ema_trail_span (default 50)
         - cfg.live_position_size (opcional, para LIVE con Exchange)
     """
-
+    def __init__(
+        self,
+        exchange: IExchange,
+    ) -> None:
+        self.exchange=exchange
+    
     def simulate_trade(
         self,
         symbol: str,
@@ -296,7 +302,6 @@ class DefaultPositionStrategy:
         entry: Entry,
         style: GreenStyle,
         cfg: Any,
-        exchange: IExchange,
     ) -> Optional[TradeResult]:
         tf_price = style.position_price_tf
         tf_ema = style.position_ema_tf
@@ -311,7 +316,7 @@ class DefaultPositionStrategy:
         df_ema = df_ema.sort_values("timestamp").reset_index(drop=True)
 
         # Precio de entrada = close de la vela entry_time
-        row_entry = df_price[df_price["timestamp"] == entry.entry_time]
+        row_entry = df_price[df_price["timestamp"] == entry.end]
         if row_entry.empty:
             return None
 
@@ -331,9 +336,9 @@ class DefaultPositionStrategy:
                 return None
             rr_planned = (entry_price - tp) / one_r
             
-        max_holding_minutes = getattr(style, "max_holding_minutes", 24 * 60)
-        ema_trail_buffer_pct = float(getattr(cfg, "ema_trail_buffer_pct", 0.002))
-        ema_span = int(getattr(cfg, "ema_trail_span", 50))
+        max_holding_minutes = getattr(style, "entry_max_minutes", 24 * 60)
+        ema_trail_buffer_pct = float(getattr(cfg, "position_ema_trail_buffer_pct", 0.002))
+        ema_span = int(getattr(cfg, "position_ema_trail_span", 50))
 
         # Crear posición real si corresponde
         position_id: Optional[str] = None
@@ -341,7 +346,7 @@ class DefaultPositionStrategy:
         if size > 0:
             side = "long" if entry.direction == "long" else "short"
             try:
-                position_id = exchange.create_position(
+                position_id = self.exchange.create_position(
                     symbol=symbol,
                     side=side,
                     size=size,
@@ -356,7 +361,7 @@ class DefaultPositionStrategy:
 
         pos = _simulate_position(
             direction=entry.direction,
-            entry_time=entry.entry_time,
+            entry_time=entry.end,
             entry_price=entry_price,
             sl_price=sl,
             tp_price=tp,
@@ -365,19 +370,19 @@ class DefaultPositionStrategy:
             ema_trail_buffer_pct=ema_trail_buffer_pct,
             ema_span=ema_span,
             max_holding_minutes=max_holding_minutes,
-            exchange=exchange,
+            exchange=self.exchange,
             position_id=position_id,
         )
 
         if pos is None:
             return None
 
-        impulse_start = getattr(entry.impulse, "start", getattr(entry.impulse, "start_time", None))
+        impulse_start = getattr(entry.trigger.pullback.impulse, "start", getattr(entry.trigger.pullback.impulse, "start_time", None))
 
         return TradeResult(
             symbol=symbol,
             direction=entry.direction,
-            entry_time=entry.entry_time,
+            entry_time=entry.end,
             entry_price=entry_price,
             sl_initial=sl,
             tp_initial=tp,
@@ -386,7 +391,6 @@ class DefaultPositionStrategy:
             result=pos.result,
             rr_planned=rr_planned,
             rr_real=pos.rr_real,
-            trigger_time=entry.trigger.timestamp,
+            trigger_time=entry.trigger.end,
             impulse_start=impulse_start,
-            meta={},
         )

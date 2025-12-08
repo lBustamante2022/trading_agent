@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Dict, Any, Literal
+from datetime import datetime, timedelta
 
+import builtins as _builtins
 import numpy as np
 import pandas as pd
 
@@ -22,6 +24,53 @@ from app.green.core import ImpulseStrategy, Impulse
 from app.green.styles import GreenStyle
 from app.ta.swing_points import find_swing_highs, find_swing_lows
 
+DEBUG_IMPULSE = False
+
+def ts_to_timestamp(ts):
+    """
+    Convierte timestamps numéricos (s o ms) a pandas.Timestamp.
+    """
+    ts_int = ts
+
+    if ts_int > 1e12:  # ms
+        return pd.to_datetime(ts_int, unit="ms")
+    else:              # seconds
+        return pd.to_datetime(ts_int, unit="s")
+    
+def _log(*args, **kwargs):
+    if DEBUG_IMPULSE:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = " ".join(str(a) for a in args)
+        _builtins.print(f"[{ts} DEBUG IMPULSE] {msg}", **kwargs)
+
+def debug_print_impulses(symbol: str, impulses: list):
+    """
+    Imprime en consola un listado compacto de los impulsos detectados.
+    Útil para debugging del style SCALPING / DAY / SWING.
+    """
+    if DEBUG_IMPULSE:
+        if not impulses:
+            print(f"[{symbol}] No se detectaron impulsos.")
+            return
+
+        print(f"\n[{symbol}] === IMPULSOS DETECTADOS ({len(impulses)}) ===")
+
+        for i, imp in enumerate(impulses, start=1):
+            start = imp.start
+            end = imp.end
+            dur = end - start
+            sr  = imp.sr_level
+            dir = imp.direction
+
+            print(
+                f"  Impulso {i}: dir={dir.upper()} | "
+                f"{start} → {end} | dur={dur} | SR={sr:.2f}"
+            )
+
+        print(f"[{symbol}] === FIN LISTADO IMPULSOS ===\n")
+
+        
+print = _log  # override local
 
 # ----------------------------------------------------------------------
 # Estructura interna de nivel SR
@@ -167,6 +216,7 @@ class DefaultImpulseStrategy(ImpulseStrategy):
 
     def detect_impulses(
         self,
+        symbol: str,
         dfs: Dict[str, pd.DataFrame],
         style: GreenStyle,
         cfg: Any,
@@ -183,11 +233,12 @@ class DefaultImpulseStrategy(ImpulseStrategy):
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         # --- 1) Detectar niveles SR horizontales por swings ---
-        sr_tol_pct = float(getattr(cfg, "channel_width_pct", 5.0)) / 100.0
+        sr_tol_pct = float(getattr(cfg, "impulse_sr_price_tol_pct", 5.0)) 
+        sr_mim_tch = int(getattr(cfg, "impulse_sr_min_touches", 2)) 
         sr_levels = _detect_swing_sr_levels(
             df,
             price_tol_pct=sr_tol_pct,
-            min_touches=5,
+            min_touches=sr_mim_tch,
         )
         if not sr_levels:
             return []
@@ -224,6 +275,7 @@ class DefaultImpulseStrategy(ImpulseStrategy):
                     if c_prev >= level and c_now < level * (1.0 - break_pct):
                         impulses.append(
                             Impulse(
+                                symbol=symbol,
                                 direction="short",
                                 start=t_now,
                                 end=t_now,
@@ -238,7 +290,8 @@ class DefaultImpulseStrategy(ImpulseStrategy):
                     # Ruptura alcista de la resistencia → impulso LONG
                     if c_prev <= level and c_now > level * (1.0 + break_pct):
                         impulses.append(
-                            Impulse(
+                            Impulse(   
+                                symbol=symbol,
                                 direction="long",
                                 start=t_now,
                                 end=t_now,
@@ -252,4 +305,6 @@ class DefaultImpulseStrategy(ImpulseStrategy):
 
         # Ordenamos por tiempo por prolijidad
         impulses.sort(key=lambda imp: imp.start)
+        print(f"impulses={len(impulses)}")
+        debug_print_impulses(symbol, impulses)
         return impulses

@@ -61,30 +61,29 @@ class GreenStyle:
     # Pullback
     # -----------------------------
     pullback_sr_tolerance: float       # qué tan cerca del SR deben estar los swings
-    pullback_min_swings: int           # mínimo de swings en la cuña
     pullback_min_hours: float          # duración mínima del pullback (horas)
     pullback_max_days: float           # ventana máxima tras el impulso (días)
+    pullback_slow_body_factor: float
 
     # -----------------------------
     # Trigger
     # -----------------------------
     trigger_sr_tolerance: float        # tolerancia al SR para la diagonal
-    trigger_min_swings: int            # swings mínimos en la diagonal
     trigger_lookback_minutes: int      # ventana de búsqueda hacia atrás
     trigger_max_break_minutes: int     # tiempo máximo entre ruptura y trigger
 
     # -----------------------------
     # Entry
     # -----------------------------
-    entry_lookahead_minutes: int       # cuánto tiempo después del trigger buscamos la entrada
+    entry_max_minutes: int              # cuánto tiempo después del trigger buscamos la entrada
+    entry_sl_buffer_pct: float               # buffer extra para el SL
+    entry_min_rr: float                      # RR mínimo planeado para aceptar el trade
 
     # -----------------------------
     # Gestión de riesgo / posición
     # -----------------------------
-    sl_buffer_pct: float               # buffer extra para el SL
-    min_rr: float                      # RR mínimo planeado para aceptar el trade
-    ema_trail_buffer_pct: float        # buffer de trailing respecto a la EMA
-    ema_trail_lookback_bars: int       # barras usadas para “estabilizar” la EMA
+    position_ema_trail_buffer_pct: float        # buffer de trailing respecto a la EMA
+    position_ema_trail_lookback_bars: int       # barras usadas para “estabilizar” la EMA
 
 
 # ----------------------------------------------------------------------
@@ -103,34 +102,33 @@ DAY_STYLE = GreenStyle(
 
     position_price_tf="3m",
     position_ema_tf="5m",
-    max_holding_minutes=24 * 60,   # 24h
-
+   
     # Impulse / SR
-    impulse_min_body_pct=0.02,     # 2% de cuerpo mínimo para considerar impulso
-    impulse_break_pct=0.01,        # ruptura ~1% del SR
-    impulse_sr_price_tol_pct=0.005,  # 0.5% para agrupar swings en SR
-    impulse_sr_min_touches=5,      # mínimo 5 toques en el nivel
+    impulse_sr_price_tol_pct=0.01,  
+    impulse_sr_min_touches=3,
+    impulse_min_body_pct=0.03,     
+    impulse_break_pct=0.005,         
 
     # Pullback
-    pullback_sr_tolerance=0.02,    # 2% de tolerancia al SR
-    pullback_min_swings=2,
-    pullback_min_hours=12.0,       # pullback mínimo ~12h
-    pullback_max_days=10.0,        # ventana máx después del impulso
+    pullback_sr_tolerance=0.005,   
+    pullback_min_hours=12.0,       
+    pullback_max_days=10.0,        
+    pullback_slow_body_factor=0.6,
 
     # Trigger
-    trigger_sr_tolerance=0.05,
-    trigger_min_swings=2,
+    trigger_sr_tolerance=0.005,
     trigger_lookback_minutes=180,
     trigger_max_break_minutes=36 * 60,  # 36h
 
     # Entry
-    entry_lookahead_minutes=60,
+    entry_max_minutes=60,
+    entry_sl_buffer_pct=0.001,
+    entry_min_rr=2.0,
 
     # Gestión de riesgo / posición
-    sl_buffer_pct=0.0015,
-    min_rr=2.0,
-    ema_trail_buffer_pct=0.002,    # 0.2%
-    ema_trail_lookback_bars=50,
+    position_ema_trail_buffer_pct=0.002,    
+    position_ema_trail_lookback_bars=50,
+    max_holding_minutes=10 * 24 * 60,  
 )
 
 
@@ -143,37 +141,35 @@ SCALPING_STYLE = GreenStyle(
     pullback_tf="5m",
     trigger_tf="3m",
     entry_tf="1m",
-
     position_price_tf="1m",
     position_ema_tf="1m",
-    max_holding_minutes=4 * 60,    # 4h máx por operación
 
     # Impulse / SR
-    impulse_min_body_pct=0.08,     # 8% de cuerpo para que realmente sea un “impulso”
-    impulse_break_pct=0.015,       # ruptura un poco más fuerte (~1.5%)
-    impulse_sr_price_tol_pct=0.004,  # 0.4% para agrupar SR en intradía
-    impulse_sr_min_touches=4,
+    impulse_sr_price_tol_pct=0.005,  # 1% para agrupar SR en intradía
+    impulse_sr_min_touches=3,
+    impulse_min_body_pct=0.03,      # 8% de cuerpo para que realmente sea un “impulso”
+    impulse_break_pct=0.005,         # ruptura un poco más fuerte (~1.5%)
 
     # Pullback
-    pullback_sr_tolerance=0.015,   # un poco más cerca del SR
-    pullback_min_swings=2,
-    pullback_min_hours=2.0,        # pullback mínimo ~2h
-    pullback_max_days=2.0,         # ventana corta desde el impulso (intradía / 2 días)
+    pullback_sr_tolerance=0.005,    # un poco más cerca del SR
+    pullback_min_hours=2,           # pullback mínimo ~2h
+    pullback_max_days=1.0,          # ventana corta desde el impulso (intradía / 2 días)
+    pullback_slow_body_factor=0.6,
 
     # Trigger
-    trigger_sr_tolerance=0.04,
-    trigger_min_swings=2,
-    trigger_lookback_minutes=90,
-    trigger_max_break_minutes=12 * 60,  # 12h
+    trigger_sr_tolerance=0.005,
+    trigger_lookback_minutes=180,
+    trigger_max_break_minutes=60,   # 12h
 
     # Entry
-    entry_lookahead_minutes=30,
+    entry_max_minutes=60,
+    entry_sl_buffer_pct=0.0005,     # SL algo más ajustado
+    entry_min_rr=1.2,               # algo más permisivo en scalping
 
     # Gestión de riesgo / posición
-    sl_buffer_pct=0.0010,          # SL algo más ajustado
-    min_rr=1.5,                    # algo más permisivo en scalping
-    ema_trail_buffer_pct=0.0015,
-    ema_trail_lookback_bars=50,
+    position_ema_trail_buffer_pct=0.0015,
+    position_ema_trail_lookback_bars=50,
+    max_holding_minutes=24 * 60,     
 )
 
 
@@ -199,24 +195,23 @@ SWING_STYLE = GreenStyle(
 
     # Pullback
     pullback_sr_tolerance=0.025,
-    pullback_min_swings=2,
     pullback_min_hours=24.0,       # pullback mínimo ~1 día
     pullback_max_days=30.0,        # ventana más larga
+    pullback_slow_body_factor=0.6,
 
     # Trigger
     trigger_sr_tolerance=0.05,
-    trigger_min_swings=2,
     trigger_lookback_minutes=24 * 60,     # 1 día hacia atrás
     trigger_max_break_minutes=7 * 24 * 60,  # hasta 7 días desde ruptura
 
     # Entry
-    entry_lookahead_minutes=4 * 60,    # hasta 4h después del trigger
+    entry_max_minutes=4 * 60,    # hasta 4h después del trigger
+    entry_sl_buffer_pct=0.0025,
+    entry_min_rr=2.0,
 
     # Gestión de riesgo / posición
-    sl_buffer_pct=0.0025,
-    min_rr=2.0,
-    ema_trail_buffer_pct=0.002,
-    ema_trail_lookback_bars=50,
+    position_ema_trail_buffer_pct=0.002,
+    position_ema_trail_lookback_bars=50,
 )
 
 
