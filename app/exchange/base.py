@@ -13,7 +13,7 @@ Cualquier implementación concreta debe cumplir la interfaz IExchange.
 
 from __future__ import annotations
 
-from typing import Protocol, Optional
+from typing import Protocol, Optional, Dict, Any, Iterator
 from datetime import datetime
 
 import pandas as pd
@@ -117,5 +117,31 @@ class IExchange(Protocol):
             - En live: normalmente datetime.utcnow().
 
         Sirve para logs, timeouts, y decisiones dependientes del tiempo.
+        """
+        ...
+
+    
+    def iter_position_bars(
+        self,
+        symbol: str,
+        price_tf: str,
+        ema_tf: str,
+        start_time: pd.Timestamp,
+        max_minutes: int,
+        ema_span: int,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Iterador de barras para gestión de posición.
+
+        Debe rendir dicts con:
+            - "timestamp": pd.Timestamp
+            - "high": float
+            - "low": float
+            - "close": float
+            - "ema": float  (EMA calculada en ema_tf con span=ema_span)
+
+        Position NO debe saber si está en backtest o live.
+        BacktestExchange lo implementa leyendo de DF internos;
+        OkxExchange lo implementa consultando al exchange real.
         """
         ...

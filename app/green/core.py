@@ -31,44 +31,48 @@ print = _log  # override local
 
 @dataclass(frozen=True)
 class Impulse:
-    symbol: str
-    direction: str              # "long" / "short"
-    start: pd.Timestamp
-    end: pd.Timestamp
-    sr_level: float
+    meta: Dict[str, Any]
+    # symbol: str
+    # direction: str              # "long" / "short"
+    # start: pd.Timestamp
+    # end: pd.Timestamp
+    # sr_level: float
 
 
 @dataclass(frozen=True)
 class Pullback:
-    symbol: str
-    direction: str
+    # symbol: str
+    # direction: str
     impulse: Impulse
-    start: pd.Timestamp
-    end: pd.Timestamp
+    meta: Dict[str, Any]
+    # start: pd.Timestamp
+    # end: pd.Timestamp
     # swings: List[Dict[str, Any]]
-    end_close: float                 
+    # end_close: float                 
 
 
 @dataclass(frozen=True)
 class Trigger:
-    symbol: str
-    direction: str
+    # symbol: str
+    # direction: str
     pullback: Pullback
-    start: pd.Timestamp
-    end: pd.Timestamp
-    end_close: float
+    meta: Dict[str, Any]
+    # start: pd.Timestamp
+    # end: pd.Timestamp
+    # end_close: float
 
 
 @dataclass(frozen=True)
 class Entry:
-    symbol: str
-    direction: str
+    # symbol: str
+    # direction: str
     trigger: Trigger
-    start: pd.Timestamp
-    end: pd.Timestamp
-    entry: float
-    sl: float
-    tp: float
+    meta: Dict[str, Any]
+    # start: pd.Timestamp
+    # end: pd.Timestamp
+    # entry: float
+    # sl: float
+    # tp: float
 
 
 @dataclass(frozen=True)
@@ -108,9 +112,9 @@ class PullbackStrategy(Protocol):
         self,
         symbol: str,
         dfs: Dict[str, pd.DataFrame],
-        impulse: Impulse,
         style: GreenStyle,
         cfg: Any,
+        impulse: Impulse,
     ) -> List[Pullback]:
         ...
 
@@ -120,9 +124,9 @@ class TriggerStrategy(Protocol):
         self,
         symbol: str,
         dfs: Dict[str, pd.DataFrame],
-        pullback: Pullback,
         style: GreenStyle,
         cfg: Any,
+        pullback: Pullback,
     ) -> List[Trigger]:
         ...
 
@@ -132,21 +136,21 @@ class EntryStrategy(Protocol):
         self,
         symbol: str,
         dfs: Dict[str, pd.DataFrame],
-        trigger: Trigger,
         style: GreenStyle,
         cfg: Any,
+        trigger: Trigger,
     ) -> Optional[Entry]:
         ...
 
 
 class PositionStrategy(Protocol):
-    def simulate_trade(
+    def gestion_trade(
         self,
         symbol: str,
         dfs: Dict[str, pd.DataFrame],
-        entry: Entry,
         style: GreenStyle,
         cfg: Any,
+        entry: Entry,
     ) -> Optional[TradeResult]:
         ...
 
@@ -192,7 +196,7 @@ class GreenV3Core:
 
         print(f"impulses={len(impulses)}")
         for imp in impulses:
-            print(f"IMP {imp.direction} start={imp.start} SR={imp.sr_level:.4f} ")
+            print(f"IMP {imp.meta['direction']} start={imp.meta['start']} SR={imp.meta['sr_level']:.4f} ")
             took_direction = {"long": False, "short": False}
 
             pullbacks = self.stages.pullback.detect_pullbacks(
@@ -206,7 +210,7 @@ class GreenV3Core:
                 continue
 
             for pb in pullbacks:
-                print(f"PBK {pb.direction} start={pb.start} price={pb.end_close} ")
+                print(f"PBK {pb.meta['direction']} start={pb.meta['start']} price={pb.meta['end_close']} ")
 
                 triggers = self.stages.trigger.detect_triggers(
                     symbol=symbol,
@@ -219,8 +223,8 @@ class GreenV3Core:
                     continue
 
                 for tg in triggers:
-                    print(f"TGR {pb.direction} price={pb.end_close:.4f} start={pb.start} end={pb.end} ")
-                    if took_direction.get(tg.direction, False):
+                    print(f"TGR {pb.meta['direction']} price={pb.meta['end_close']:.4f} start={pb.meta['start']} end={pb.meta['end']} ")
+                    if took_direction.get(tg.meta["direction"], False):
                         continue
 
                     entry = self.stages.entry.detect_entry(
@@ -233,8 +237,8 @@ class GreenV3Core:
                     if entry is None:
                         continue
 
-                    print(f"ETR {entry.direction} entry={entry.entry} tp={entry.tp} sl={entry.sl} time={entry.end}")
-                    trade_res = self.stages.position.simulate_trade(
+                    print(f"ETR {entry.meta['direction']} entry={entry.meta['entry']} tp={entry.meta['tp']} sl={entry.meta['sl']} time={entry.meta['end']}")
+                    trade_res = self.stages.position.gestion_trade(
                         symbol=symbol,
                         dfs=dfs,
                         entry=entry,

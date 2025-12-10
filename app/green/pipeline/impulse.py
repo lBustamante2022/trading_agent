@@ -26,6 +26,7 @@ from app.ta.swing_points import find_swing_highs, find_swing_lows
 
 DEBUG_IMPULSE = False
 
+
 def ts_to_timestamp(ts):
     """
     Convierte timestamps numéricos (s o ms) a pandas.Timestamp.
@@ -36,12 +37,14 @@ def ts_to_timestamp(ts):
         return pd.to_datetime(ts_int, unit="ms")
     else:              # seconds
         return pd.to_datetime(ts_int, unit="s")
-    
+
+
 def _log(*args, **kwargs):
     if DEBUG_IMPULSE:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         msg = " ".join(str(a) for a in args)
         _builtins.print(f"[{ts} DEBUG IMPULSE] {msg}", **kwargs)
+
 
 def debug_print_impulses(symbol: str, impulses: list):
     """
@@ -56,11 +59,11 @@ def debug_print_impulses(symbol: str, impulses: list):
         print(f"\n[{symbol}] === IMPULSOS DETECTADOS ({len(impulses)}) ===")
 
         for i, imp in enumerate(impulses, start=1):
-            start = imp.start
-            end = imp.end
+            start = imp.meta["start"]
+            end = imp.meta["end"]
             dur = end - start
-            sr  = imp.sr_level
-            dir = imp.direction
+            sr = imp.meta["sr_level"]
+            dir = imp.meta["direction"]
 
             print(
                 f"  Impulso {i}: dir={dir.upper()} | "
@@ -69,8 +72,9 @@ def debug_print_impulses(symbol: str, impulses: list):
 
         print(f"[{symbol}] === FIN LISTADO IMPULSOS ===\n")
 
-        
+
 print = _log  # override local
+
 
 # ----------------------------------------------------------------------
 # Estructura interna de nivel SR
@@ -212,6 +216,25 @@ class DefaultImpulseStrategy(ImpulseStrategy):
           * cuerpo de la vela (|close-open|/open) >= impulse_min_body_pct.
 
       - Para soporte (LONG): análogo pero al alza.
+
+    Metadatos enriquecidos para TriggerAI:
+
+      Cada Impulse.meta incluye:
+
+        - symbol, direction, start, end, sr_level  (como antes)
+        - sr_kind            → "support" / "resistance"
+        - sr_touches         → cuántos toques formaron el SR
+        - sr_first_ts        → primer toque del SR
+        - sr_last_ts         → último toque del SR antes del impulso
+
+        - body_pct           → |close-open| / open
+        - range_pct          → (high-low) / open
+        - break_pct          → magnitud relativa de la ruptura del SR
+
+        - local_volatility_pct → rango medio (high-low)/close de las últimas
+                                 N velas antes del impulso (por defecto 10)
+        - bar_index          → índice de la vela en el DataFrame
+        - prev_close         → close de la vela anterior
     """
 
     def detect_impulses(
@@ -227,28 +250,34 @@ class DefaultImpulseStrategy(ImpulseStrategy):
         if df is None or df.empty:
             return []
 
-        if "timestamp" not in df.columns or "open" not in df.columns or "close" not in df.columns:
+        required_cols = {"timestamp", "open", "high", "low", "close"}
+        if not required_cols.issubset(df.columns):
             return []
 
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         # --- 1) Detectar niveles SR horizontales por swings ---
-        sr_tol_pct = float(getattr(cfg, "impulse_sr_price_tol_pct", 5.0)) 
-        sr_mim_tch = int(getattr(cfg, "impulse_sr_min_touches", 2)) 
+        sr_tol_pct = float(getattr(cfg, "impulse_sr_price_tol_pct", 5.0))
+        sr_min_tch = int(getattr(cfg, "impulse_sr_min_touches", 2))
         sr_levels = _detect_swing_sr_levels(
             df,
             price_tol_pct=sr_tol_pct,
-            min_touches=sr_mim_tch,
+            min_touches=sr_min_tch,
         )
         if not sr_levels:
             return []
 
         closes = df["close"].to_numpy()
         opens = df["open"].to_numpy()
+        highs = df["high"].to_numpy()
+        lows = df["low"].to_numpy()
         ts = df["timestamp"]
 
-        break_pct = float(getattr(cfg, "impulse_break_pct", 0.01))  # 1% por defecto
+        break_pct_min = float(getattr(cfg, "impulse_break_pct", 0.01))  # 1% por defecto
         min_body_pct = float(getattr(style, "impulse_min_body_pct", 0.02))
+
+        # Lookback para volatilidad local (en velas)
+        vol_lookback = int(getattr(cfg, "impulse_vol_lookback", 10))
 
         impulses: List[Impulse] = []
 
@@ -261,6 +290,8 @@ class DefaultImpulseStrategy(ImpulseStrategy):
                 c_prev = float(closes[i - 1])
                 c_now = float(closes[i])
                 o_now = float(opens[i])
+                h_now = float(highs[i])
+                l_now = float(lows[i])
                 t_now = ts.iloc[i]
 
                 # tamaño del cuerpo en %
@@ -270,16 +301,49 @@ class DefaultImpulseStrategy(ImpulseStrategy):
                     i += 1
                     continue
 
+                # rango relativo de la vela
+                range_pct = (h_now - l_now) / max(o_now, 1e-9)
+
+                # volatilidad local previa (simple: rango medio de N velas)
+                if i > 1:
+                    start_idx = max(0, i - vol_lookback)
+                    sub_high = highs[start_idx:i]
+                    sub_low = lows[start_idx:i]
+                    sub_close = closes[start_idx:i]
+                    if len(sub_close) > 0:
+                        avg_range = np.mean(sub_high - sub_low)
+                        avg_close = max(np.mean(sub_close), 1e-9)
+                        local_volatility_pct = avg_range / avg_close
+                    else:
+                        local_volatility_pct = 0.0
+                else:
+                    local_volatility_pct = 0.0
+
                 if lvl.kind == "support":
                     # Ruptura bajista del soporte → impulso SHORT
-                    if c_prev >= level and c_now < level * (1.0 - break_pct):
+                    if c_prev >= level and c_now < level * (1.0 - break_pct_min):
+                        # magnitud real de ruptura respecto al SR
+                        break_pct = max((level - c_now) / max(level, 1e-9), 0.0)
+
                         impulses.append(
                             Impulse(
-                                symbol=symbol,
-                                direction="short",
-                                start=t_now,
-                                end=t_now,
-                                sr_level=level,
+                                meta={
+                                    "symbol": symbol,
+                                    "direction": "short",
+                                    "start": t_now,
+                                    "end": t_now,
+                                    "sr_level": level,
+                                    "sr_kind": "support",
+                                    "sr_touches": int(lvl.touches),
+                                    "sr_first_ts": lvl.first_ts,
+                                    "sr_last_ts": lvl.last_ts,
+                                    "body_pct": body_pct,
+                                    "range_pct": range_pct,
+                                    "break_pct": break_pct,
+                                    "local_volatility_pct": local_volatility_pct,
+                                    "bar_index": int(i),
+                                    "prev_close": c_prev,
+                                }
                             )
                         )
                         # saltamos unas velas para no duplicar impulsos pegados
@@ -288,14 +352,28 @@ class DefaultImpulseStrategy(ImpulseStrategy):
 
                 else:  # resistance
                     # Ruptura alcista de la resistencia → impulso LONG
-                    if c_prev <= level and c_now > level * (1.0 + break_pct):
+                    if c_prev <= level and c_now > level * (1.0 + break_pct_min):
+                        break_pct = max((c_now - level) / max(level, 1e-9), 0.0)
+
                         impulses.append(
-                            Impulse(   
-                                symbol=symbol,
-                                direction="long",
-                                start=t_now,
-                                end=t_now,
-                                sr_level=level,
+                            Impulse(
+                                meta={
+                                    "symbol": symbol,
+                                    "direction": "long",
+                                    "start": t_now,
+                                    "end": t_now,
+                                    "sr_level": level,
+                                    "sr_kind": "resistance",
+                                    "sr_touches": int(lvl.touches),
+                                    "sr_first_ts": lvl.first_ts,
+                                    "sr_last_ts": lvl.last_ts,
+                                    "body_pct": body_pct,
+                                    "range_pct": range_pct,
+                                    "break_pct": break_pct,
+                                    "local_volatility_pct": local_volatility_pct,
+                                    "bar_index": int(i),
+                                    "prev_close": c_prev,
+                                }
                             )
                         )
                         i += 3
@@ -304,7 +382,7 @@ class DefaultImpulseStrategy(ImpulseStrategy):
                 i += 1
 
         # Ordenamos por tiempo por prolijidad
-        impulses.sort(key=lambda imp: imp.start)
+        impulses.sort(key=lambda imp: imp.meta["start"])
         print(f"impulses={len(impulses)}")
         debug_print_impulses(symbol, impulses)
         return impulses

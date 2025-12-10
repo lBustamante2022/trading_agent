@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
-from datetime import datetime
-
+from typing import Dict, Optional, Any, Iterator, List
+from datetime import datetime, timedelta, timezone
+import time
 import pandas as pd
 
 from app.exchange.base import IExchange
@@ -32,6 +32,10 @@ try:
     from okx.Trade_api import TradeAPI
 except Exception:
     raise ImportError("Falta instalar el SDK oficial de OKX: pip install okx-python")
+
+
+# Debug local para este módulo
+DEBUG_OKX = False
 
 
 @dataclass
@@ -74,25 +78,46 @@ class OkxExchange(IExchange):
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
     ) -> pd.DataFrame:
-        params = {
-            "instId": symbol.replace("/", "-"),
-            "bar": timeframe,
-            "limit": 300,
-        }
+        """
+        Implementación pendiente. Podés reutilizar la misma lógica de
+        _fetch_ohlcv construyendo un DataFrame.
+        """
+        raise NotImplementedError
 
-        if start:
-            params["before"] = int(start.timestamp() * 1000)
-        if end:
-            params["after"] = int(end.timestamp() * 1000)
+    def _fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str,
+        since_ms: int,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """
+        Wrapper interno para traer velas desde OKX.
+
+        Devuelve lista de dicts:
+            - "timestamp": pd.Timestamp (UTC)
+            - "open", "high", "low", "close": float
+        """
+        inst = symbol.replace("/", "-")
+        params: Dict[str, Any] = {
+            "instId": inst,
+            "bar": timeframe,
+            "limit": str(limit),
+        }
+        # OKX usa before/after; acá usamos 'before' como inicio aproximado.
+        # Chequear doc oficial y ajustar según sea necesario.
+        params["before"] = str(since_ms)
 
         data = self.market.get_history_candlesticks(**params)
-
         if "data" not in data or not data["data"]:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            return []
 
-        rows = []
+        rows: List[Dict[str, Any]] = []
+        # La API devuelve velas en orden descendente; las ordenamos luego.
         for ohlc in data["data"]:
-            ts = datetime.fromtimestamp(int(ohlc[0]) / 1000)
+            # ohlc[0] = ts ms, [1]=open, [2]=high, [3]=low, [4]=close, [5]=vol
+            ts_ms = int(ohlc[0])
+            ts = pd.to_datetime(ts_ms, unit="ms", utc=True)
             rows.append(
                 {
                     "timestamp": ts,
@@ -104,14 +129,122 @@ class OkxExchange(IExchange):
                 }
             )
 
-        df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+        rows = sorted(rows, key=lambda r: r["timestamp"])
+        return rows
 
-        if start:
-            df = df[df["timestamp"] >= start]
-        if end:
-            df = df[df["timestamp"] <= end]
+    def iter_position_bars(
+        self,
+        symbol: str,
+        price_tf: str,
+        ema_tf: str,
+        start_time: pd.Timestamp,
+        max_minutes: int,
+        ema_span: int,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Itera barras de precio en vivo desde OKX.
 
-        return df
+        - Arranca en start_time.
+        - Sigue pidiendo nuevas velas mientras:
+              now < start_time + max_minutes
+        - Calcula EMA incrementalmente en ema_tf.
+        """
+        if not isinstance(start_time, pd.Timestamp):
+            start_time = pd.to_datetime(start_time)
+
+        end_time = start_time + timedelta(minutes=max_minutes)
+
+        # Estado EMA (TF de EMA puede ser igual o distinto a price_tf)
+        ema_values: List[Dict[str, Any]] = []
+
+        # Trabajamos en ms desde epoch (UTC)
+        current_from = int(start_time.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+        # Mapping TF->segundos (ajustar si usás otros)
+        tf_to_secs = {
+            "1m": 60,
+            "3m": 180,
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "1h": 3600,
+            "4h": 14400,
+            "1d": 86400,
+            "1w": 604800,
+        }
+        step_secs = tf_to_secs.get(price_tf, 60)
+
+        last_bar_ts: Optional[pd.Timestamp] = None
+
+        while True:
+            now = datetime.now(timezone.utc)
+            if now >= end_time.replace(tzinfo=timezone.utc):
+                break
+
+            # Traer velas nuevas de precio
+            try:
+                ohlcv = self._fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=price_tf,
+                    since_ms=current_from,
+                    limit=200,
+                )
+            except Exception as e:
+                if DEBUG_OKX:
+                    print(f"[OKX] Error fetch_ohlcv price: {e}")
+                time.sleep(1)
+                continue
+
+            if not ohlcv:
+                # No hay velas nuevas todavía, esperamos un poco
+                time.sleep(step_secs / 2)
+                continue
+
+            # Procesar velas en orden cronológico
+            for bar in ohlcv:
+                t = bar["timestamp"]
+                if not isinstance(t, pd.Timestamp):
+                    t = pd.to_datetime(t, unit="ms", utc=True)
+
+                if t < start_time:
+                    continue
+                if t > end_time:
+                    break
+
+                h = float(bar.get("high", bar["close"]))
+                l = float(bar.get("low", bar["close"]))
+                c = float(bar["close"])
+
+                # Actualizar estado de EMA en TF de EMA
+                # (para simplificar, usamos el mismo flujo con ema_tf == price_tf)
+                ema_values.append({"timestamp": t, "close": c})
+                df_ema = pd.DataFrame(ema_values).sort_values("timestamp")
+                df_ema["ema"] = df_ema["close"].ewm(
+                    span=ema_span,
+                    adjust=False,
+                ).mean()
+
+                ema_row = df_ema[df_ema["timestamp"] <= t].tail(1)
+                if not ema_row.empty and not pd.isna(ema_row["ema"].iloc[0]):
+                    ema_val = float(ema_row["ema"].iloc[0])
+                else:
+                    ema_val = c
+
+                last_bar_ts = t
+                yield {
+                    "timestamp": t,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "ema": ema_val,
+                }
+
+            # Avanzar "since" para la próxima llamada
+            if last_bar_ts is not None:
+                current_from = int(last_bar_ts.timestamp() * 1000) + 1
+
+            # Esperar un poco antes de la próxima consulta
+            time.sleep(step_secs / 2)
 
     # ------------------------- create_position -----------------------
     def create_position(

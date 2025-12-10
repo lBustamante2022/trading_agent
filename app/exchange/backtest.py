@@ -15,8 +15,8 @@ Solo sabe:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
-from datetime import datetime
+from typing import Dict, Optional, Any, Iterator
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -75,6 +75,7 @@ class BacktestExchange(IExchange):
         self._candles_by_symbol: Dict[str, Dict[str, pd.DataFrame]] = candles_by_symbol or {}
         self._positions: Dict[str, BacktestPosition] = {}
         self._now: datetime = clock_start or datetime.utcnow()
+
     # ------------------------------------------------------------------
     # Utilidad interna: normalizar timestamp
     # ------------------------------------------------------------------
@@ -177,3 +178,75 @@ class BacktestExchange(IExchange):
 
     def set_now(self, new_now: datetime) -> None:
         self._now = new_now
+
+    # ------------------------------------------------------------------
+    # IExchange: iteración de barras para gestión de posición
+    # ------------------------------------------------------------------
+    def iter_position_bars(
+        self,
+        symbol: str,
+        price_tf: str,
+        ema_tf: str,
+        start_time: pd.Timestamp,
+        max_minutes: int,
+        ema_span: int,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Itera barras de precio desde los DF del backtest, calculando EMA
+        y rindiendo una barra por vela de price_tf hasta max_minutes.
+        """
+        if not isinstance(start_time, pd.Timestamp):
+            start_time = pd.to_datetime(start_time)
+
+        end_time = start_time + timedelta(minutes=max_minutes)
+
+        symbol_maps = self._candles_by_symbol.get(symbol, {})
+        df_price = symbol_maps.get(price_tf)
+        if df_price is None or df_price.empty:
+            return
+
+        df_price = self._ensure_ts_index(df_price)
+        df_price = df_price.sort_values("timestamp").reset_index(drop=True)
+        df_price = df_price[
+            (df_price["timestamp"] > start_time) &
+            (df_price["timestamp"] <= end_time)
+        ].copy()
+
+        if df_price.empty:
+            return
+
+        # DF para EMA (puede ser mismo TF o distinto)
+        df_ema_tf = symbol_maps.get(ema_tf, df_price)
+        if df_ema_tf is None or df_ema_tf.empty:
+            df_ema_tf = df_price
+
+        df_ema_tf = self._ensure_ts_index(df_ema_tf)
+        df_ema_tf = df_ema_tf.sort_values("timestamp").reset_index(drop=True)
+        df_ema_tf["ema"] = df_ema_tf["close"].ewm(
+            span=ema_span,
+            adjust=False,
+        ).mean()
+
+        # Iteramos velas de precio, buscando EMA más reciente <= t
+        for _, row in df_price.iterrows():
+            t = row["timestamp"]
+            if not isinstance(t, pd.Timestamp):
+                t = pd.to_datetime(t)
+
+            h = float(row.get("high", row["close"]))
+            l = float(row.get("low", row["close"]))
+            c = float(row["close"])
+
+            ema_row = df_ema_tf[df_ema_tf["timestamp"] <= t].tail(1)
+            if not ema_row.empty and not pd.isna(ema_row["ema"].iloc[0]):
+                ema_val = float(ema_row["ema"].iloc[0])
+            else:
+                ema_val = c  # fallback
+
+            yield {
+                "timestamp": t,
+                "high": h,
+                "low": l,
+                "close": c,
+                "ema": ema_val,
+            }

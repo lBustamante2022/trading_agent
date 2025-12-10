@@ -156,7 +156,8 @@ def run_backtest(
     input_dir: str,
     output_dir: str,
     days: int = 360,
-    ai_supervisor: bool = False
+    ai_supervisor: bool = False,
+    saveResults: bool = True
 ):
     print(f"\n========== BACKTEST {symbol} ({style.name}) ==========")
 
@@ -168,7 +169,7 @@ def run_backtest(
     print(f"[{symbol}] Recortando últimos {days} días...")
     dfs = filter_last_days(dfs, days=days)
 
-    exchange = BacktestExchange()
+    exchange = BacktestExchange(candles_by_symbol={symbol: dfs})
     impulse_strategy = DefaultImpulseStrategy()
     pullback_strategy = DefaultPullbackStrategy()
     trigger_strategy = DefaultTriggerStrategy()
@@ -203,13 +204,13 @@ def run_backtest(
 
     df = pd.DataFrame([asdict(t) for t in trades])
 
-    os.makedirs(output_dir, exist_ok=True)
-    sym_clean = symbol.replace("/", "")
-    out_csv = os.path.join(output_dir, f"backtest_{sym_clean}_{style.name}.csv")
-    df.to_csv(out_csv, index=False)
-    print(f"[{symbol}] Trades guardados en {out_csv} ({len(df)} filas).")
-
-    plot_equity_and_hist(df, symbol, style, output_dir)
+    if saveResults:
+        os.makedirs(output_dir, exist_ok=True)
+        sym_clean = symbol.replace("/", "")
+        out_csv = os.path.join(output_dir, f"backtest_{sym_clean}_{style.name}.csv")
+        df.to_csv(out_csv, index=False)
+        print(f"[{symbol}] Trades guardados en {out_csv} ({len(df)} filas).")
+        plot_equity_and_hist(df, symbol, style, output_dir)
 
     return df
 
@@ -226,29 +227,52 @@ def run_optimizer(
     ai_supervisor: bool = False,
 ):
     """
-    Ejecuta un grid de parámetros basado en SCALPING_STYLE y
-    genera un CSV con:
+    Ejecuta un grid de parámetros y genera un CSV con:
       - symbol
       - parámetros de la configuración
       - resultados (wins, be, losses, total_R, avg_R)
     """
 
-    if base_style.name.upper() != "SCALPING":
-        print(f"[{symbol}] WARNING: el optimizador está pensado para SCALPING, estilo actual={base_style.name}")
+    if base_style.name.upper() != "DAY":
+        print(f"[{symbol}] WARNING: el optimizador está pensado para DAY, estilo actual={base_style.name}")
     
     # --- Definí acá el grid a probar (puedes ajustarlo a gusto) ---
     param_grid: Dict[str, List[Any]] = {
-        "impulse_min_body_pct":   [0.02, 0.03, 0.04],
-        "impulse_break_pct":      [0.003, 0.005, 0.007],
+        "impulse_min_body_pct":   [0.04, 0.05, 0.06],
+        "impulse_break_pct":      [0.005, 0.01, 0.015],
 
         "pullback_sr_tolerance":  [0.003, 0.005, 0.007],
-        "pullback_slow_body_factor": [0.5, 0.6, 0.7],
+        "pullback_slow_body_factor": [0.4, 0.5, 0.6],
     
         "trigger_sr_tolerance":   [0.003, 0.005, 0.007],
+        "trigger_entry_ema_length": [8, 20, 50],
+        "trigger_entry_body_min_ratio": [0.4, 0.5, 0.6],
 
-        "entry_sl_buffer_pct":    [0.0005, 0.0010],
-        "entry_min_rr":           [1.2, 1.5, 2.0],
+        "entry_sl_buffer_pct":    [0.0005, 0.001],
+        "entry_min_rr":           [1.5, 2.0, 2.5],
+
+        "position_ema_trail_span": [8, 20, 50]
     }
+
+    # if base_style.name.upper() != "SCALPING":
+    #     print(f"[{symbol}] WARNING: el optimizador está pensado para SCALPING, estilo actual={base_style.name}")
+    
+    # # --- Definí acá el grid a probar (puedes ajustarlo a gusto) ---
+    # param_grid: Dict[str, List[Any]] = {
+    #     "impulse_min_body_pct":   [0.02, 0.03, 0.04],
+    #     "impulse_break_pct":      [0.003, 0.005, 0.007],
+
+    #     "pullback_sr_tolerance":  [0.003, 0.005, 0.007],
+    #     "pullback_slow_body_factor": [0.5, 0.6, 0.7],
+    
+    #     "trigger_sr_tolerance":   [0.003, 0.005, 0.007],
+
+    #     "entry_sl_buffer_pct":    [0.0005, 0.0010],
+    #     "entry_min_rr":           [1.2, 1.5, 2.0],
+
+    #     "position_ema_trail_span": [8, 20, 50]
+    # }
+
 
     results_rows: List[Dict[str, Any]] = []
 
@@ -269,6 +293,7 @@ def run_optimizer(
             output_dir=output_dir,
             days=days,
             ai_supervisor=ai_supervisor,
+            saveResults=False
         )
 
         if trades_df is None or trades_df.empty:

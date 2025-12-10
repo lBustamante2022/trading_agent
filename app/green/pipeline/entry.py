@@ -1,49 +1,26 @@
-# app/green/pipeline/entry.py
-"""
-Detección de ENTRY para GREEN v3 (arquitectura nueva).
-
-Reglas:
-
-    - TF usado: style.entry_tf
-    - Ventana temporal:
-          desde trigger.timestamp
-          hasta trigger.timestamp + cfg.entry_lookahead_minutes
-
-    - Confirmación mínima:
-          LONG  → close > trigger.ref_price
-          SHORT → close < trigger.ref_price
-
-    - SL:
-          - Debe cubrir el mínimo/máximo de TODO el pullback
-            (rango de precios del pullback) más un pequeño buffer (sl_buffer_pct).
-
-    - TP:
-          - SHORT → TP en el MÍNIMO precio desde que inició el pullback.
-          - LONG  → TP en el MÁXIMO precio desde que inició el pullback.
-          - El RR real (TP “natural” vs SL) debe ser >= min_rr.
-            Si no se cumple, se descarta esa vela como entrada.
-
-Devuelve 0 o 1 Entry por trigger.
-"""
+# ================================================================
+# ENTRY para GREEN V3 — versión mejorada
+#
+# Cambios clave:
+#   ✔ SL robusto basado en TODO el pullback
+#   ✔ RR mínimo pero sin TP "artificial"
+#   ✔ COOLDOWN fuerte por pullback (set interno)
+#   ✔ mantiene API original para el pipeline
+# ================================================================
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional, Any
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional
+from datetime import datetime
+import time
 import builtins as _builtins
 
 import pandas as pd
-import time
 
-from app.green.core import Entry, Trigger
+from app.green.core import Trigger, Entry
 from app.green.styles import GreenStyle
 from app.ai.green_supervisor import review_setup_with_ai
-
-
-# ----------------------------------------------------------------------
-# DEBUG PRINT LOCAL
-# ----------------------------------------------------------------------
 
 DEBUG_ENTRY = False
 
@@ -55,36 +32,33 @@ def _log(*args, **kwargs):
         _builtins.print(f"[{ts} DEBUG ENTRY] {msg}", **kwargs)
 
 
-print = _log  # override local
+print = _log  # override
 
 
 def delay_ms(ms: int):
-    """
-    Pausa la ejecución la cantidad de milisegundos indicada.
-    """
     time.sleep(ms / 1000.0)
 
-# ----------------------------------------------------------------------
+
+# ================================================================
 # ENTRY STRATEGY
-# ----------------------------------------------------------------------
+# ================================================================
 
 @dataclass
 class DefaultEntryStrategy:
     """
-    Estrategia genérica de entrada posterior al trigger.
+    Estrategia genérica de ENTRY posterior al Trigger.
 
-    Parámetros usados desde cfg:
-      - entry_lookahead_minutes
-      - sl_buffer_pct
-      - min_rr
-
-    Del style:
-      - entry_tf
-
-    ai_supervisor:
-      - Si es True, pasa el setup por el supervisor IA como última regla.
+    - No espera más velas: Trigger ya eligió la vela "buena".
+    - Calcula SL robusto usando TODO el pullback.
+    - Valida un RR mínimo usando un TP "natural" (estructura).
+    - Implementa cooldown FUERTE por pullback:
+        un mismo rango de pullback solo puede generar UNA entrada.
     """
+
     ai_supervisor: bool = False
+
+    # set de IDs de pullback ya usados (para todo el backtest/run)
+    used_pullbacks: set[str] = field(default_factory=set, repr=False)
 
     def detect_entry(
         self,
@@ -95,199 +69,160 @@ class DefaultEntryStrategy:
         trigger: Trigger,
     ) -> Optional[Entry]:
 
+        pb = trigger.pullback
+        impulse = pb.impulse
+        direction = trigger.meta["direction"]
+
+        # ------------------------------------------------------------
+        # Identificador único del pullback (cooldown fuerte)
+        # ------------------------------------------------------------
+        pb_start_ts = impulse.meta.get("end", pb.meta["start"])
+        pb_end_ts = pb.meta["end"]
+
+        if not isinstance(pb_start_ts, pd.Timestamp):
+            pb_start_ts = pd.to_datetime(pb_start_ts)
+        if not isinstance(pb_end_ts, pd.Timestamp):
+            pb_end_ts = pd.to_datetime(pb_end_ts)
+
+        pb_id = f"{symbol}|{direction}|{pb_start_ts.isoformat()}|{pb_end_ts.isoformat()}"
+
+        if pb_id in self.used_pullbacks:
+            print(f"ENTRY descartado: pullback ya operado ({pb_id}).")
+            return None
+
+        # Marcamos como usado
+        self.used_pullbacks.add(pb_id)
+
+        # (Seguimos manteniendo el flag en meta por si ayuda a debug)
+        pb.meta["_entry_used"] = True
+
+        # ------------------------------------------------------------
+        # Datos de mercado
+        # ------------------------------------------------------------
         tf = style.entry_tf
         df = dfs.get(tf)
         if df is None or df.empty:
             return None
 
-        if "timestamp" not in df.columns or "close" not in df.columns:
-            return None
-
         df = df.sort_values("timestamp").reset_index(drop=True)
 
-        lookahead = int(getattr(cfg, "entry_max_minutes", 60))
+        entry_time = trigger.meta["end"]
+        entry_price = float(trigger.meta["end_close"])
+
+        if not isinstance(entry_time, pd.Timestamp):
+            entry_time = pd.to_datetime(entry_time)
+
+        # Parámetros
         sl_buf = float(getattr(cfg, "entry_sl_buffer_pct", 0.002))
         min_rr = float(getattr(cfg, "entry_min_rr", 2.0))
 
-        direction = trigger.direction
-        start_ts = trigger.end
-        end_ts = start_ts + timedelta(minutes=lookahead)
-
-        pb_close = float(trigger.end_close)
-
-        df_win = df[
-            (df["timestamp"] >= start_ts) &
-            (df["timestamp"] <= end_ts)
-        ].copy()
-
-        if df_win.empty:
-            return None
-
-        print(
-            f"dir={direction}, tf={tf}, "
-            f"start={start_ts}, end={end_ts}, pb_close={pb_close:.2f}"
-        )
-
-        # --------------------------------------------------------------
-        # Info del pullback para SL y TP "natural"
-        # --------------------------------------------------------------
-        pb = trigger.pullback
-
-        # Intentamos tomar el inicio del pullback como el primer swing.
-        # swings = getattr(pb, "swings", [])
-        # if swings:
-        #     pb_start_ts = min(ts for (ts, _) in swings)
-        # else:
-        #     # Fallback: fin del impulso como inicio de pullback
-        pb_start_ts = pb.impulse.end
-        pb_end_ts = pb.end
-
-        # Rango completo del pullback en el TF de entrada
-        df_pb_range = df[
+        # ------------------------------------------------------------
+        # RANGO del PULLBACK para construir SL robusto
+        # ------------------------------------------------------------
+        df_pb = df[
             (df["timestamp"] >= pb_start_ts) &
             (df["timestamp"] <= pb_end_ts)
         ].copy()
 
-        pb_low = None
-        pb_high = None
-        if not df_pb_range.empty and "low" in df_pb_range.columns and "high" in df_pb_range.columns:
-            pb_low = float(df_pb_range["low"].min())
-            pb_high = float(df_pb_range["high"].max())
+        if df_pb.empty or "low" not in df_pb.columns or "high" not in df_pb.columns:
+            print("ENTRY descartado: no se pudo obtener rango del pullback.")
+            return None
+
+        pb_low = float(df_pb["low"].min())
+        pb_high = float(df_pb["high"].max())
+
+        print(f"PB RANGE: low={pb_low:.2f}, high={pb_high:.2f}")
+
+        # ------------------------------------------------------------
+        # SL robusto
+        # ------------------------------------------------------------
+        if direction == "long":
+            base_sl = pb_low
+            sl = base_sl * (1.0 - sl_buf)
+            if sl >= entry_price:
+                print("SL inválido en LONG (sl >= entry).")
+                return None
+        else:  # short
+            base_sl = pb_high
+            sl = base_sl * (1.0 + sl_buf)
+            if sl <= entry_price:
+                print("SL inválido en SHORT (sl <= entry).")
+                return None
+
+        # Distancia 1R
+        if direction == "long":
+            one_r = entry_price - sl
+        else:
+            one_r = sl - entry_price
+
+        if one_r <= 0:
+            print("ENTRY descartado: 1R no positivo.")
+            return None
+
+        # ------------------------------------------------------------
+        # TP NATURAL para validar RR mínimo
+        # (Trailing real se maneja luego en Position)
+        # ------------------------------------------------------------
+        if direction == "long":
+            tp_nat = pb_high
+            if tp_nat <= entry_price:
+                print("TP natural inválido para LONG.")
+                return None
+            rr = (tp_nat - entry_price) / one_r
+        else:
+            tp_nat = pb_low
+            if tp_nat >= entry_price:
+                print("TP natural inválido para SHORT.")
+                return None
+            rr = (entry_price - tp_nat) / one_r
+
+        # ------------------------------------------------------------
+        # Validar RR mínimo
+        # ------------------------------------------------------------
+        if rr < min_rr:
+            print(
+                f"ENTRY descartado por RR insuficiente: rr={rr:.2f} < min_rr={min_rr}"
+            )
+            return None
+
+        tp = tp_nat  # TP de referencia; trailing se encargará después
 
         print(
-            f"PB RANGE [{pb_start_ts} → {pb_end_ts}] "
-            f"pb_low={pb_low}, pb_high={pb_high}"
+            f"ENTRY OK: dir={direction} entry={entry_price:.2f} sl={sl:.2f} "
+            f"tp_nat={tp:.2f} RR={rr:.2f}"
         )
 
-        # --------------------------------------------------------------
-        # Buscamos la PRIMER vela que confirme la ruptura
-        # --------------------------------------------------------------
-        for _, row in df_win.iterrows():
-            ts = row["timestamp"]
-            close = float(row["close"])
-            high = float(row.get("high", close))
-            low = float(row.get("low", close))
+        entry = Entry(
+            trigger=trigger,
+            meta={
+                "symbol": symbol,
+                "direction": direction,
+                "start": trigger.meta.get("start", pb.meta.get("start", pb_start_ts)),
+                "end": entry_time,
+                "entry": entry_price,
+                "sl": sl,
+                "tp": tp,
+            },
+        )
 
-            # ---------------------------------------------
-            # 1) Confirmación de entrada
-            # ---------------------------------------------
-            if direction == "long":
-                if close <= pb_close:
-                    continue
-                entry_price = close
-            else:  # short
-                if close >= pb_close:
-                    continue
-                entry_price = close
-
-            # ---------------------------------------------
-            # 2) SL basado en TODO el pullback
-            #    - LONG  → por debajo del mínimo low del pullback
-            #    - SHORT → por encima del máximo high del pullback
-            # ---------------------------------------------
-            if pb_low is None or pb_high is None:
-                # Sin info de rango → mejor no tomar la operación
-                continue
-
-            if direction == "long":
-                base_sl = pb_low
-                sl = base_sl * (1.0 - sl_buf)
-            else:  # short
-                base_sl = pb_high
-                sl = base_sl * (1.0 + sl_buf)
-
-
-            # Validar que el SL siga estando del lado correcto
-            if direction == "long" and sl >= entry_price:
-                continue
-            if direction == "short" and sl <= entry_price:
-                continue
-
-            # ---------------------------------------------
-            # 3) TP "natural" según inicio del pullback
-            #
-            #    - SHORT → TP en el mínimo precio desde inicio del pullback
-            #    - LONG  → TP en el máximo precio desde inicio del pullback
-            #      (usando el rango pb_low / pb_high)
-            # ---------------------------------------------
-            if pb_low is None or pb_high is None:
-                # Sin info de rango → mejor no tomar la operación
-                continue
-
-            if direction == "long":
-                tp_natural = pb_high
-                # TP debe estar por encima de la entrada
-                if tp_natural <= entry_price:
-                    continue
-                one_r = entry_price - sl
-                if one_r <= 0:
-                    continue
-                rr = (tp_natural - entry_price) / one_r
-                if rr < min_rr:
-                    print(
-                        f"LONG tp_natural RR insuficiente: "
-                        f"entry={entry_price:.4f} tp={tp_natural:.4f} sl={sl:.4f} rr={rr:.2f} < min_rr={min_rr:.2f} → descarto"
-                    )
-                    continue
-                tp = tp_natural
-            else:  # short
-                tp_natural = pb_low
-                # TP debe estar por debajo de la entrada
-                if tp_natural >= entry_price:
-                    continue
-                one_r = sl - entry_price
-                if one_r <= 0:
-                    continue
-                rr = (entry_price - tp_natural) / one_r
-                if rr < min_rr:
-                    print(
-                        f"SHORT tp_natural RR insuficiente: "
-                        f"entry={entry_price:.4f} tp={tp_natural:.4f} sl={sl:.4f} rr={rr:.2f} < min_rr={min_rr:.2f} → descarto"
-                    )
-                    continue
-                tp = tp_natural
-
-            print(
-                f"FOUND at {ts}, dir={direction}, "
-                f"entry={entry_price:.2f}, sl={sl:.2f}, tp={tp:.2f}, "
-                f"RR={rr:.2f} (min_rr={min_rr})"
-            )
-
-            entry = Entry(
+        # ------------------------------------------------------------
+        # Supervisor IA (opcional)
+        # ------------------------------------------------------------
+        if self.ai_supervisor:
+            decision = review_setup_with_ai(
                 symbol=symbol,
-                direction=direction,
-                start=start_ts,
-                end=ts,
-                entry=entry_price,
-                sl=sl,
-                tp=tp,
+                style=style,
+                impulse=pb.impulse,
+                pullback=pb,
                 trigger=trigger,
+                entry=entry,
+                dfs=dfs,
             )
-
-            # ─────────────────────────────────────
-            # 4) Supervisor IA (último filtro opcional)
-            # ─────────────────────────────────────
-            if self.ai_supervisor:
-                decision = review_setup_with_ai(
-                    symbol=trigger.symbol,
-                    style=style,
-                    impulse=trigger.pullback.impulse,
-                    pullback=trigger.pullback,
-                    trigger=trigger,
-                    entry=entry,
-                    dfs=dfs,
+            if not decision.approved:
+                print(
+                    f"AI Rechaza ENTRY: motivo={decision.reason}, "
+                    f"conf={decision.confidence:.2f}"
                 )
-                if not decision.approved:
-                    print(
-                        f"ai supervisor: Rechazó setup en {symbol} | "
-                        f"dir={entry.direction} | motivo={decision.reason} "
-                        f"(conf={decision.confidence:.2f})"
-                    )
-                    delay_ms(1000)
-                    return None
+                return None
 
-            # Si llegamos acá, la entrada es válida
-            return entry
-
-        # No se encontró ninguna vela válida
-        return None
+        return entry

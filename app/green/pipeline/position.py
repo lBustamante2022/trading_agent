@@ -1,22 +1,34 @@
-# app/green/pipeline/position.py
 """
-Gestión de posición para GREEN V3 (arquitectura nueva).
+Gestión de posición para GREEN V3 (arquitectura nueva, revisada).
+
+Cambios clave:
+
+    - simulate_trade → gestion_trade (nombre solicitado).
+    - Usa exchange.iter_position_bars(...) para avanzar vela a vela
+      tanto en backtest como en live.
+    - Mantiene lógica de:
+        * TP1 → mover SL.
+        * TP2 → SL a BE y activar trailing EMA.
+        * SL / TP / timeout → cierre posición.
+    - NO hace TP parcial (solo trailing vía SL).
+    - Corrige clasificación de resultado:
+        * RR_real > 0  → "win"
+        * RR_real ≈ 0  → "be"
+        * RR_real < 0  → "loss"
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Any
-from datetime import datetime, timedelta
 import builtins as _builtins
 
 import pandas as pd
 import numpy as np
 
-from app.green.core import Entry, Impulse, TradeResult
+from app.green.core import Entry, TradeResult
 from app.green.styles import GreenStyle
 from app.exchange.base import IExchange
-from app.ai.green_supervisor import review_setup_with_ai, AISupervisorDecision
 
 # ----------------------------------------------------------------------
 # DEBUG LOCAL
@@ -26,276 +38,38 @@ DEBUG_POSITION = False
 
 
 def _log(*args, **kwargs):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    msg = " ".join(str(a) for a in args)
-    _builtins.print(f"[{ts}] {msg}", **kwargs)
+    if DEBUG_POSITION:
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = " ".join(str(a) for a in args)
+        _builtins.print(f"[{ts} DEBUG POSITION] {msg}", **kwargs)
 
 
 print = _log  # override local
 
 
 # ----------------------------------------------------------------------
-# Resultado interno de gestión
-# ----------------------------------------------------------------------
-
-@dataclass
-class PositionResult:
-    exit_time: pd.Timestamp
-    exit_price: float
-    result: str      # "win" | "loss" | "be"
-    rr_real: float   # R realizado
-
-
-# ----------------------------------------------------------------------
-# Motor de gestión (TP1 / TP2 / BE / EMA + timeout)
-# ----------------------------------------------------------------------
-
-def _simulate_position(
-    direction: str,
-    entry_time: pd.Timestamp,
-    entry_price: float,
-    sl_price: float,
-    tp_price: float,
-    df_price: pd.DataFrame,
-    df_ema_tf: pd.DataFrame,
-    ema_trail_buffer_pct: float,
-    ema_span: int,
-    max_holding_minutes: int,
-    exchange: IExchange,
-    position_id: Optional[str] = None,
-) -> Optional[PositionResult]:
-    if df_price is None or df_price.empty:
-        return None
-    if df_ema_tf is None or df_ema_tf.empty:
-        return None
-
-    # 1) EMA en TF de trailing
-    df_ema = df_ema_tf.copy().sort_values("timestamp")
-    df_ema["ema"] = df_ema["close"].ewm(span=ema_span, adjust=False).mean()
-
-    # 2) Ventana de vida
-    end_time = entry_time + timedelta(minutes=max_holding_minutes)
-    df_price = df_price[
-        (df_price["timestamp"] >= entry_time) &
-        (df_price["timestamp"] <= end_time)
-    ].copy()
-    df_price = df_price.sort_values("timestamp").reset_index(drop=True)
-    if df_price.empty:
-        return None
-
-    # 3) TP1 / TP2
-    if direction == "long":
-        zone = tp_price - entry_price
-        if zone <= 0:
-            return None
-        tp1 = entry_price + zone / 3.0
-        tp2 = entry_price + 2.0 * zone / 3.0
-    else:
-        zone = entry_price - tp_price
-        if zone <= 0:
-            return None
-        tp1 = entry_price - zone / 3.0
-        tp2 = entry_price - 2.0 * zone / 3.0
-
-    orig_sl = sl_price
-    sl = sl_price
-    state = "initial"   # "initial" → "after_tp1" → "after_tp2"
-
-    # 1R
-    if direction == "long":
-        one_r = entry_price - orig_sl
-    else:
-        one_r = orig_sl - entry_price
-    if one_r <= 0:
-        return None
-
-    # 4) Vela a vela
-    for _, row in df_price.iterrows():
-        t = row["timestamp"]
-        h = float(row.get("high", row["close"]))
-        l = float(row.get("low", row["close"]))
-
-        # Trailing EMA
-        if state == "after_tp2":
-            ema_row = df_ema[df_ema["timestamp"] <= t].tail(1)
-            if not ema_row.empty:
-                ema = float(ema_row["ema"].iloc[0])
-                buffer = ema * ema_trail_buffer_pct
-                if direction == "long":
-                    trail_sl = ema - buffer
-                    sl = max(sl, trail_sl)
-                else:
-                    trail_sl = ema + buffer
-                    sl = min(sl, trail_sl)
-
-                if exchange is not None and position_id is not None:
-                    try:
-                        exchange.update_sl_tp(position_id, sl=sl, tp=tp_price)
-                    except Exception as e:
-                        if DEBUG_POSITION:
-                            print(f"[POSITION] Error update_sl_tp trailing: {e}")
-
-        # Check SL / TP
-        if direction == "long":
-            # SL
-            if l <= sl:
-                exit_price = sl
-                if exchange is not None and position_id is not None:
-                    try:
-                        exchange.close_position(position_id, reason="sl_hit")
-                    except Exception as e:
-                        if DEBUG_POSITION:
-                            print(f"[POSITION] Error close_position SL: {e}")
-
-                if np.isclose(exit_price, entry_price) or exit_price > entry_price:
-                    result = "be"
-                    rr_real = 0.0
-                else:
-                    result = "loss"
-                    rr_real = (exit_price - entry_price) / one_r
-                return PositionResult(t, exit_price, result, rr_real)
-
-            # TP1 / TP2 / TP
-            if state == "initial" and h >= tp1:
-                sl = entry_price - 0.5 * (entry_price - orig_sl)
-                state = "after_tp1"
-                if exchange is not None and position_id is not None:
-                    try:
-                        exchange.update_sl_tp(position_id, sl=sl, tp=tp_price)
-                    except Exception as e:
-                        if DEBUG_POSITION:
-                            print(f"[POSITION] Error update_sl_tp TP1: {e}")
-
-            if state in ("initial", "after_tp1") and h >= tp2:
-                sl = entry_price
-                state = "after_tp2"
-                if exchange is not None and position_id is not None:
-                    try:
-                        exchange.update_sl_tp(position_id, sl=sl, tp=tp_price)
-                    except Exception as e:
-                        if DEBUG_POSITION:
-                            print(f"[POSITION] Error update_sl_tp TP2: {e}")
-
-            if h >= tp_price:
-                exit_price = tp_price
-                if exchange is not None and position_id is not None:
-                    try:
-                        exchange.close_position(position_id, reason="tp_hit")
-                    except Exception as e:
-                        if DEBUG_POSITION:
-                            print(f"[POSITION] Error close_position TP: {e}")
-
-                result = "win"
-                rr_real = (exit_price - entry_price) / one_r
-                return PositionResult(t, exit_price, result, rr_real)
-
-        else:  # short
-            # SL
-            if h >= sl:
-                exit_price = sl
-                if exchange is not None and position_id is not None:
-                    try:
-                        exchange.close_position(position_id, reason="sl_hit")
-                    except Exception as e:
-                        if DEBUG_POSITION:
-                            print(f"[POSITION] Error close_position SL: {e}")
-
-                if np.isclose(exit_price, entry_price) or exit_price < entry_price:
-                    result = "be"
-                    rr_real = 0.0
-                else:
-                    result = "loss"
-                    rr_real = (entry_price - exit_price) / one_r
-                return PositionResult(t, exit_price, result, rr_real)
-
-            # TP1 / TP2 / TP
-            if state == "initial" and l <= tp1:
-                sl = entry_price + 0.5 * (orig_sl - entry_price)
-                state = "after_tp1"
-                if exchange is not None and position_id is not None:
-                    try:
-                        exchange.update_sl_tp(position_id, sl=sl, tp=tp_price)
-                    except Exception as e:
-                        if DEBUG_POSITION:
-                            print(f"[POSITION] Error update_sl_tp TP1: {e}")
-
-            if state in ("initial", "after_tp1") and l <= tp2:
-                sl = entry_price
-                state = "after_tp2"
-                if exchange is not None and position_id is not None:
-                    try:
-                        exchange.update_sl_tp(position_id, sl=sl, tp=tp_price)
-                    except Exception as e:
-                        if DEBUG_POSITION:
-                            print(f"[POSITION] Error update_sl_tp TP2: {e}")
-
-            if l <= tp_price:
-                exit_price = tp_price
-                if exchange is not None and position_id is not None:
-                    try:
-                        exchange.close_position(position_id, reason="tp_hit")
-                    except Exception as e:
-                        if DEBUG_POSITION:
-                            print(f"[POSITION] Error close_position TP: {e}")
-
-                result = "win"
-                rr_real = (entry_price - exit_price) / one_r
-                return PositionResult(t, exit_price, result, rr_real)
-
-    # 5) Timeout
-    last = df_price.iloc[-1]
-    t = last["timestamp"]
-    exit_price = float(last["close"])
-
-    if exchange is not None and position_id is not None:
-        try:
-            exchange.close_position(position_id, reason="timeout")
-        except Exception as e:
-            if DEBUG_POSITION:
-                print(f"[POSITION] Error close_position timeout: {e}")
-
-    if direction == "long":
-        rr_real = (exit_price - entry_price) / one_r
-    else:
-        rr_real = (entry_price - exit_price) / one_r
-
-    if rr_real > 0:
-        result = "win"
-    elif np.isclose(rr_real, 0.0):
-        result = "be"
-        rr_real = 0.0
-    else:
-        result = "loss"
-
-    return PositionResult(t, exit_price, result, rr_real)
-
-
-# ----------------------------------------------------------------------
-# Estrategia de posición para el pipeline GREEN V3
+# Estrategia de posición
 # ----------------------------------------------------------------------
 
 @dataclass
 class DefaultPositionStrategy:
-    exchange: IExchange
     """
     Estrategia de posición genérica para GREEN V3.
 
     Usa:
         - style.position_price_tf
         - style.position_ema_tf
-        - style.max_holding_minutes
+        - style.max_holding_minutes (o entry_max_minutes como fallback)
 
-        - cfg.ema_trail_buffer_pct (default 0.002)
-        - cfg.ema_trail_span (default 50)
+        - cfg.position_ema_trail_buffer_pct (default 0.002)
+        - cfg.position_ema_trail_span (default 50)
         - cfg.live_position_size (opcional, para LIVE con Exchange)
     """
-    def __init__(
-        self,
-        exchange: IExchange,
-    ) -> None:
-        self.exchange=exchange
-    
-    def simulate_trade(
+
+    exchange: IExchange
+
+    def gestion_trade(
         self,
         symbol: str,
         dfs: Dict[str, pd.DataFrame],
@@ -303,29 +77,44 @@ class DefaultPositionStrategy:
         style: GreenStyle,
         cfg: Any,
     ) -> Optional[TradeResult]:
+
+        direction = entry.meta["direction"]  # "long" / "short"
+        entry_time = entry.meta["end"]
+        if not isinstance(entry_time, pd.Timestamp):
+            entry_time = pd.to_datetime(entry_time)
+
         tf_price = style.position_price_tf
         tf_ema = style.position_ema_tf
 
+        # DataFrames de referencia (para backtest o validaciones)
         df_price = dfs.get(tf_price)
         df_ema = dfs.get(tf_ema)
 
-        if df_price is None or df_price.empty or df_ema is None or df_ema.empty:
+        if df_price is None or df_price.empty:
             return None
+        if df_ema is None or df_ema.empty:
+            # fallback: usar df_price para EMA si hiciera falta
+            df_ema = df_price
 
         df_price = df_price.sort_values("timestamp").reset_index(drop=True)
         df_ema = df_ema.sort_values("timestamp").reset_index(drop=True)
 
-        # Precio de entrada = close de la vela entry_time
-        row_entry = df_price[df_price["timestamp"] == entry.end]
-        if row_entry.empty:
-            return None
+        # Precio de entrada:
+        #  - Usamos preferentemente el "entry" que calculó Entry.
+        #  - Fallback: close de la vela de entry_time.
+        entry_price = float(entry.meta.get("entry", np.nan))
+        if np.isnan(entry_price):
+            row_entry = df_price[df_price["timestamp"] == entry_time]
+            if row_entry.empty:
+                return None
+            entry_price = float(row_entry["close"].iloc[0])
 
-        entry_price = float(row_entry["close"].iloc[0])
-        sl = float(entry.sl)
-        tp = float(entry.tp)
+        sl = float(entry.meta["sl"])
+        tp = float(entry.meta["tp"])
+        orig_sl = sl
 
-        # RR planificado
-        if entry.direction == "long":
+        # 1R planificado y RR objetivo (informativo)
+        if direction == "long":
             one_r = entry_price - sl
             if one_r <= 0:
                 return None
@@ -335,16 +124,28 @@ class DefaultPositionStrategy:
             if one_r <= 0:
                 return None
             rr_planned = (entry_price - tp) / one_r
-            
-        max_holding_minutes = getattr(style, "entry_max_minutes", 24 * 60)
-        ema_trail_buffer_pct = float(getattr(cfg, "position_ema_trail_buffer_pct", 0.002))
+
+        # Tiempo máximo de vida de la posición
+        max_holding_minutes = int(
+            getattr(
+                style,
+                "max_holding_minutes",
+                getattr(style, "entry_max_minutes", 24 * 60),
+            )
+        )
+
+        ema_trail_buffer_pct = float(
+            getattr(cfg, "position_ema_trail_buffer_pct", 0.002)
+        )
         ema_span = int(getattr(cfg, "position_ema_trail_span", 50))
 
-        # Crear posición real si corresponde
+        # --------------------------------------------------------------
+        # Crear posición real si corresponde (live)
+        # --------------------------------------------------------------
         position_id: Optional[str] = None
         size = float(getattr(cfg, "live_position_size", 0.0))
         if size > 0:
-            side = "long" if entry.direction == "long" else "short"
+            side = "long" if direction == "long" else "short"
             try:
                 position_id = self.exchange.create_position(
                     symbol=symbol,
@@ -356,41 +157,320 @@ class DefaultPositionStrategy:
                 )
             except Exception as e:
                 if DEBUG_POSITION:
-                    print(f"[POSITION] Error create_position en exchange: {e}")
+                    print(f"Error create_position en exchange: {e}")
                 position_id = None
 
-        pos = _simulate_position(
-            direction=entry.direction,
-            entry_time=entry.end,
-            entry_price=entry_price,
-            sl_price=sl,
-            tp_price=tp,
-            df_price=df_price,
-            df_ema_tf=df_ema,
-            ema_trail_buffer_pct=ema_trail_buffer_pct,
+        # --------------------------------------------------------------
+        # Iterador de barras desde el Exchange
+        #   - Backtest: recorre DF interno.
+        #   - Live: trae velas reales (REST/WebSocket).
+        # --------------------------------------------------------------
+        bars_iter = self.exchange.iter_position_bars(
+            symbol=symbol,
+            price_tf=tf_price,
+            ema_tf=tf_ema,
+            start_time=entry_time,
+            max_minutes=max_holding_minutes,
             ema_span=ema_span,
-            max_holding_minutes=max_holding_minutes,
-            exchange=self.exchange,
-            position_id=position_id,
         )
 
-        if pos is None:
+        # Estados de gestión
+        state = "initial"   # "initial" → "after_tp1" → "after_tp2"
+
+        # Precalcular TP1 / TP2 en términos de precio
+        if direction == "long":
+            zone = tp - entry_price
+            if zone <= 0:
+                return None
+            tp1 = entry_price + zone / 3.0
+            tp2 = entry_price + 2.0 * zone / 3.0
+        else:
+            zone = entry_price - tp
+            if zone <= 0:
+                return None
+            tp1 = entry_price - zone / 3.0
+            tp2 = entry_price - 2.0 * zone / 3.0
+
+        last_bar_time: Optional[pd.Timestamp] = None
+        last_close: Optional[float] = None
+
+        # --------------------------------------------------------------
+        # LOOP vela a vela
+        # --------------------------------------------------------------
+        for bar in bars_iter:
+            t = bar["timestamp"]
+            if not isinstance(t, pd.Timestamp):
+                t = pd.to_datetime(t)
+
+            h = float(bar.get("high", bar["close"]))
+            l = float(bar.get("low", bar["close"]))
+            c = float(bar["close"])
+            ema_val = float(bar["ema"])
+
+            last_bar_time = t
+            last_close = c
+
+            # Trailing EMA (solo después de TP2)
+            if state == "after_tp2":
+                buffer = ema_val * ema_trail_buffer_pct
+                if direction == "long":
+                    trail_sl = ema_val - buffer
+                    sl = max(sl, trail_sl)
+                else:
+                    trail_sl = ema_val + buffer
+                    sl = min(sl, trail_sl)
+
+                if position_id is not None:
+                    try:
+                        self.exchange.update_sl_tp(position_id, sl=sl, tp=tp)
+                    except Exception as e:
+                        if DEBUG_POSITION:
+                            print(f"Error update_sl_tp trailing: {e}")
+
+            # ----------------------------------------------------------
+            # Check de SL / TP1 / TP2 / TP
+            # ----------------------------------------------------------
+            if direction == "long":
+                # SL
+                if l <= sl:
+                    exit_price = sl
+                    reason = "sl_hit"
+
+                    if position_id is not None:
+                        try:
+                            self.exchange.close_position(position_id, reason=reason)
+                        except Exception as e:
+                            if DEBUG_POSITION:
+                                print(f"Error close_position SL: {e}")
+
+                    rr_real = (exit_price - entry_price) / one_r
+                    result = self._classify_result(rr_real)
+                    return self._build_trade_result(
+                        symbol=symbol,
+                        entry=entry,
+                        entry_price=entry_price,
+                        sl_initial=orig_sl,
+                        tp_initial=tp,
+                        exit_time=t,
+                        exit_price=exit_price,
+                        result=result,
+                        rr_planned=rr_planned,
+                        rr_real=rr_real,
+                    )
+
+                # TP1
+                if state == "initial" and h >= tp1:
+                    # subimos SL a mitad del camino entre entry y SL original
+                    sl = entry_price - 0.5 * (entry_price - orig_sl)
+                    state = "after_tp1"
+                    if position_id is not None:
+                        try:
+                            self.exchange.update_sl_tp(position_id, sl=sl, tp=tp)
+                        except Exception as e:
+                            if DEBUG_POSITION:
+                                print(f"Error update_sl_tp TP1: {e}")
+
+                # TP2
+                if state in ("initial", "after_tp1") and h >= tp2:
+                    sl = entry_price  # SL a BE
+                    state = "after_tp2"
+                    if position_id is not None:
+                        try:
+                            self.exchange.update_sl_tp(position_id, sl=sl, tp=tp)
+                        except Exception as e:
+                            if DEBUG_POSITION:
+                                print(f"Error update_sl_tp TP2: {e}")
+
+                # TP final
+                if h >= tp:
+                    exit_price = tp
+                    reason = "tp_hit"
+
+                    if position_id is not None:
+                        try:
+                            self.exchange.close_position(position_id, reason=reason)
+                        except Exception as e:
+                            if DEBUG_POSITION:
+                                print(f"Error close_position TP: {e}")
+
+                    rr_real = (exit_price - entry_price) / one_r
+                    result = self._classify_result(rr_real)
+                    return self._build_trade_result(
+                        symbol=symbol,
+                        entry=entry,
+                        entry_price=entry_price,
+                        sl_initial=orig_sl,
+                        tp_initial=tp,
+                        exit_time=t,
+                        exit_price=exit_price,
+                        result=result,
+                        rr_planned=rr_planned,
+                        rr_real=rr_real,
+                    )
+
+            else:  # SHORT
+                # SL
+                if h >= sl:
+                    exit_price = sl
+                    reason = "sl_hit"
+
+                    if position_id is not None:
+                        try:
+                            self.exchange.close_position(position_id, reason=reason)
+                        except Exception as e:
+                            if DEBUG_POSITION:
+                                print(f"Error close_position SL: {e}")
+
+                    rr_real = (entry_price - exit_price) / one_r
+                    result = self._classify_result(rr_real)
+                    return self._build_trade_result(
+                        symbol=symbol,
+                        entry=entry,
+                        entry_price=entry_price,
+                        sl_initial=orig_sl,
+                        tp_initial=tp,
+                        exit_time=t,
+                        exit_price=exit_price,
+                        result=result,
+                        rr_planned=rr_planned,
+                        rr_real=rr_real,
+                    )
+
+                # TP1
+                if state == "initial" and l <= tp1:
+                    sl = entry_price + 0.5 * (orig_sl - entry_price)
+                    state = "after_tp1"
+                    if position_id is not None:
+                        try:
+                            self.exchange.update_sl_tp(position_id, sl=sl, tp=tp)
+                        except Exception as e:
+                            if DEBUG_POSITION:
+                                print(f"Error update_sl_tp TP1: {e}")
+
+                # TP2
+                if state in ("initial", "after_tp1") and l <= tp2:
+                    sl = entry_price  # SL a BE
+                    state = "after_tp2"
+                    if position_id is not None:
+                        try:
+                            self.exchange.update_sl_tp(position_id, sl=sl, tp=tp)
+                        except Exception as e:
+                            if DEBUG_POSITION:
+                                print(f"Error update_sl_tp TP2: {e}")
+
+                # TP final
+                if l <= tp:
+                    exit_price = tp
+                    reason = "tp_hit"
+
+                    if position_id is not None:
+                        try:
+                            self.exchange.close_position(position_id, reason=reason)
+                        except Exception as e:
+                            if DEBUG_POSITION:
+                                print(f"Error close_position TP: {e}")
+
+                    rr_real = (entry_price - exit_price) / one_r
+                    result = self._classify_result(rr_real)
+                    return self._build_trade_result(
+                        symbol=symbol,
+                        entry=entry,
+                        entry_price=entry_price,
+                        sl_initial=orig_sl,
+                        tp_initial=tp,
+                        exit_time=t,
+                        exit_price=exit_price,
+                        result=result,
+                        rr_planned=rr_planned,
+                        rr_real=rr_real,
+                    )
+
+        # --------------------------------------------------------------
+        # TIMEOUT: si el iterador terminó sin tocar SL/TP
+        # --------------------------------------------------------------
+        if last_bar_time is None or last_close is None:
+            # No hubo ni una barra tras la entrada
             return None
 
-        impulse_start = getattr(entry.trigger.pullback.impulse, "start", getattr(entry.trigger.pullback.impulse, "start_time", None))
+        exit_time = last_bar_time
+        exit_price = float(last_close)
+
+        if position_id is not None:
+            try:
+                self.exchange.close_position(position_id, reason="timeout")
+            except Exception as e:
+                if DEBUG_POSITION:
+                    print(f"Error close_position timeout: {e}")
+
+        if direction == "long":
+            rr_real = (exit_price - entry_price) / one_r
+        else:
+            rr_real = (entry_price - exit_price) / one_r
+
+        result = self._classify_result(rr_real)
+
+        return self._build_trade_result(
+            symbol=symbol,
+            entry=entry,
+            entry_price=entry_price,
+            sl_initial=orig_sl,
+            tp_initial=tp,
+            exit_time=exit_time,
+            exit_price=exit_price,
+            result=result,
+            rr_planned=rr_planned,
+            rr_real=rr_real,
+        )
+
+    # ------------------------------------------------------------------
+    # Helper: clasificar resultado según RR realizado
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _classify_result(rr_real: float) -> str:
+        if np.isclose(rr_real, 0.0, atol=1e-6):
+            return "be"
+        if rr_real > 0:
+            return "win"
+        return "loss"
+
+    # ------------------------------------------------------------------
+    # Helper: construir TradeResult coherente con el core
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_trade_result(
+        symbol: str,
+        entry: Entry,
+        entry_price: float,
+        sl_initial: float,
+        tp_initial: float,
+        exit_time: pd.Timestamp,
+        exit_price: float,
+        result: str,
+        rr_planned: float,
+        rr_real: float,
+    ) -> TradeResult:
+
+        direction = entry.meta["direction"]
+        trigger_time = entry.trigger.meta["end"]
+
+        impulse_start = getattr(
+            entry.trigger.pullback.impulse,
+            "start",
+            getattr(entry.trigger.pullback.impulse, "start_time", None),
+        )
 
         return TradeResult(
             symbol=symbol,
-            direction=entry.direction,
-            entry_time=entry.end,
+            direction=direction,
+            entry_time=entry.meta["end"],
             entry_price=entry_price,
-            sl_initial=sl,
-            tp_initial=tp,
-            exit_time=pos.exit_time,
-            exit_price=pos.exit_price,
-            result=pos.result,
+            sl_initial=sl_initial,
+            tp_initial=tp_initial,
+            exit_time=exit_time,
+            exit_price=exit_price,
+            result=result,
             rr_planned=rr_planned,
-            rr_real=pos.rr_real,
-            trigger_time=entry.trigger.end,
+            rr_real=rr_real,
+            trigger_time=trigger_time,
             impulse_start=impulse_start,
         )
