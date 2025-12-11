@@ -382,6 +382,23 @@ class DefaultPullbackStrategy(PullbackStrategy):
 
                 rebound_ts, rebound_close, rebound_body_ratio = rebound
 
+                # 5) Que NO se haya roto el SR EN CONTRA antes del toque
+                #    (para SHORT: highs demasiado por encima de la resistencia)
+                df_path = df_win[
+                    (df_win["timestamp"] > impulse.meta["end"]) &
+                    (df_win["timestamp"] <= last_ts)
+                ].copy()
+                if not df_path.empty:
+                    max_high = float(df_path["high"].max())
+                    overshoot = (max_high - sr_level) / sr_level
+                    if overshoot > tol_sr:
+                        print(
+                            f"[{symbol} SHORT] SR roto en contra antes del pullback: "
+                            f"max_high={max_high:.2f}, overshoot={overshoot:.4f} "
+                            f"> tol_sr={tol_sr:.4f} → descarto"
+                        )
+                        continue
+
                 _debug_swings(f"{symbol} SHORT swings_core", swings_core_ts_prices, sr_level)
 
                 pb = Pullback(
@@ -486,6 +503,23 @@ class DefaultPullbackStrategy(PullbackStrategy):
                     continue
 
                 rebound_ts, rebound_close, rebound_body_ratio = rebound
+
+                # 5bis) Que NO se haya roto el soporte EN CONTRA antes del toque
+                #       (para LONG: lows demasiado por debajo del soporte)
+                df_path = df_win[
+                    (df_win["timestamp"] > impulse.meta["end"]) &
+                    (df_win["timestamp"] <= last_ts)
+                ].copy()
+                if not df_path.empty:
+                    min_low = float(df_path["low"].min())
+                    overshoot = (sr_level - min_low) / sr_level
+                    if overshoot > tol_sr:
+                        print(
+                            f"[{symbol} LONG] SR roto en contra antes del pullback: "
+                            f"min_low={min_low:.2f}, overshoot={overshoot:.4f} "
+                            f"> tol_sr={tol_sr:.4f} → descarto"
+                        )
+                        continue
 
                 _debug_swings(f"{symbol} LONG swings_core", swings_core_ts_prices, sr_level)
 

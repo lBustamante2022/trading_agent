@@ -64,7 +64,7 @@ class DefaultPositionStrategy:
 
         - cfg.position_ema_trail_buffer_pct (default 0.002)
         - cfg.position_ema_trail_span (default 50)
-        - cfg.live_position_size (opcional, para LIVE con Exchange)
+        - cfg.position_size (opcional, para LIVE con Exchange)
     """
 
     exchange: IExchange
@@ -143,7 +143,7 @@ class DefaultPositionStrategy:
         # Crear posición real si corresponde (live)
         # --------------------------------------------------------------
         position_id: Optional[str] = None
-        size = float(getattr(cfg, "live_position_size", 0.0))
+        size = float(getattr(cfg, "position_size", 0.0))
         if size > 0:
             side = "long" if direction == "long" else "short"
             try:
@@ -451,18 +451,25 @@ class DefaultPositionStrategy:
     ) -> TradeResult:
 
         direction = entry.meta["direction"]
-        trigger_time = entry.trigger.meta["end"]
 
-        impulse_start = getattr(
-            entry.trigger.pullback.impulse,
-            "start",
-            getattr(entry.trigger.pullback.impulse, "start_time", None),
-        )
+        trigger_time = entry.trigger.meta.get("end")
+        if not isinstance(trigger_time, pd.Timestamp):
+            trigger_time = pd.to_datetime(trigger_time)
+
+        impulse = entry.trigger.pullback.impulse
+        # En la nueva arquitectura, los tiempos están en impulse.meta
+        impulse_start = impulse.meta.get("start")
+        if impulse_start is not None and not isinstance(impulse_start, pd.Timestamp):
+            impulse_start = pd.to_datetime(impulse_start)
+
+        entry_time = entry.meta.get("end")
+        if not isinstance(entry_time, pd.Timestamp):
+            entry_time = pd.to_datetime(entry_time)
 
         return TradeResult(
             symbol=symbol,
             direction=direction,
-            entry_time=entry.meta["end"],
+            entry_time=entry_time,
             entry_price=entry_price,
             sl_initial=sl_initial,
             tp_initial=tp_initial,

@@ -205,24 +205,24 @@ class DefaultEntryStrategy:
             },
         )
 
-        # ------------------------------------------------------------
-        # Supervisor IA (opcional)
-        # ------------------------------------------------------------
-        if self.ai_supervisor:
-            decision = review_setup_with_ai(
-                symbol=symbol,
-                style=style,
-                impulse=pb.impulse,
-                pullback=pb,
-                trigger=trigger,
-                entry=entry,
-                dfs=dfs,
-            )
-            if not decision.approved:
-                print(
-                    f"AI Rechaza ENTRY: motivo={decision.reason}, "
-                    f"conf={decision.confidence:.2f}"
-                )
-                return None
+        # # ------------------------------------------------------------
+        # # Supervisor IA (opcional)
+        # # ------------------------------------------------------------
+        # if self.ai_supervisor:
+        #     decision = review_setup_with_ai(
+        #         symbol=symbol,
+        #         style=style,
+        #         impulse=pb.impulse,
+        #         pullback=pb,
+        #         trigger=trigger,
+        #         entry=entry,
+        #         dfs=dfs,
+        #     )
+        #     if not decision.approved:
+        #         print(
+        #             f"AI Rechaza ENTRY: motivo={decision.reason}, "
+        #             f"conf={decision.confidence:.2f}"
+        #         )
+        #         return None
 
         return entry

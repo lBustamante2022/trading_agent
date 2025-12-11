@@ -1,4 +1,5 @@
 # app/exchange/okx.py
+
 """
 Implementación LIVE de IExchange usando el broker OKX.
 
@@ -27,11 +28,11 @@ import pandas as pd
 from app.exchange.base import IExchange
 
 try:
-    from okx.Account_api import AccountAPI
-    from okx.Market_api import MarketAPI
-    from okx.Trade_api import TradeAPI
+    import okx.Account as Account
+    import okx.Trade as Trade
+    import okx.MarketData as MarketData
 except Exception:
-    raise ImportError("Falta instalar el SDK oficial de OKX: pip install okx-python")
+    raise ImportError("Falta instalar el SDK oficial de OKX: pip install python-okx")
 
 
 # Debug local para este módulo
@@ -58,15 +59,15 @@ class OkxExchange(IExchange):
     def __init__(self):
         api_key = os.getenv("OKX_API_KEY")
         api_secret = os.getenv("OKX_API_SECRET")
-        api_pass = os.getenv("OKX_API_PASS")
+        api_pass = os.getenv("OKX_PASSPHRASE")
         flag = os.getenv("OKX_ISPAPER", "1")
         
         if not api_key or not api_secret or not api_pass:
             raise RuntimeError("Faltan credenciales OKX en variables de entorno.")
 
-        self.market = MarketAPI(api_key, api_secret, api_pass, False, flag=flag)
-        self.trade = TradeAPI(api_key, api_secret, api_pass, False, flag=flag)
-        self.account = AccountAPI(api_key, api_secret, api_pass, False, flag=flag)
+        self.market = MarketData.MarketAPI(flag=flag)
+        self.trade = Trade.TradeAPI(api_key, api_secret, api_pass, False, flag)
+        self.account = Account.AccountAPI(api_key, api_secret, api_pass, False, flag)
 
         self._positions: Dict[str, OkxPosition] = {}
 
@@ -79,10 +80,29 @@ class OkxExchange(IExchange):
         end: Optional[datetime] = None,
     ) -> pd.DataFrame:
         """
-        Implementación pendiente. Podés reutilizar la misma lógica de
-        _fetch_ohlcv construyendo un DataFrame.
+        Devuelve un DataFrame con velas OHLCV desde OKX.
+
+        Columnas:
+            timestamp (UTC), open, high, low, close, volume
+
+        - Si start es None, baja ~5 días hacia atrás (aprox).
+        - El parámetro end se ignora por ahora (OKX limita por 'limit').
         """
-        raise NotImplementedError
+        if start is None:
+            since = datetime.utcnow() - timedelta(days=5)
+        else:
+            since = start
+
+        since_ms = int(since.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+        rows = self._fetch_ohlcv(symbol=symbol, timeframe=timeframe, since_ms=since_ms, limit=300)
+        if not rows:
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+        df = pd.DataFrame(rows)
+        # Aseguramos timestamp como datetime (ya viene así desde _fetch_ohlcv)
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        return df
 
     def _fetch_ohlcv(
         self,
@@ -115,7 +135,6 @@ class OkxExchange(IExchange):
         rows: List[Dict[str, Any]] = []
         # La API devuelve velas en orden descendente; las ordenamos luego.
         for ohlc in data["data"]:
-            # ohlc[0] = ts ms, [1]=open, [2]=high, [3]=low, [4]=close, [5]=vol
             ts_ms = int(ohlc[0])
             ts = pd.to_datetime(ts_ms, unit="ms", utc=True)
             rows.append(
@@ -160,7 +179,6 @@ class OkxExchange(IExchange):
         # Trabajamos en ms desde epoch (UTC)
         current_from = int(start_time.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
-        # Mapping TF->segundos (ajustar si usás otros)
         tf_to_secs = {
             "1m": 60,
             "3m": 180,
@@ -181,7 +199,6 @@ class OkxExchange(IExchange):
             if now >= end_time.replace(tzinfo=timezone.utc):
                 break
 
-            # Traer velas nuevas de precio
             try:
                 ohlcv = self._fetch_ohlcv(
                     symbol=symbol,
@@ -196,11 +213,9 @@ class OkxExchange(IExchange):
                 continue
 
             if not ohlcv:
-                # No hay velas nuevas todavía, esperamos un poco
                 time.sleep(step_secs / 2)
                 continue
 
-            # Procesar velas en orden cronológico
             for bar in ohlcv:
                 t = bar["timestamp"]
                 if not isinstance(t, pd.Timestamp):
@@ -215,14 +230,9 @@ class OkxExchange(IExchange):
                 l = float(bar.get("low", bar["close"]))
                 c = float(bar["close"])
 
-                # Actualizar estado de EMA en TF de EMA
-                # (para simplificar, usamos el mismo flujo con ema_tf == price_tf)
                 ema_values.append({"timestamp": t, "close": c})
                 df_ema = pd.DataFrame(ema_values).sort_values("timestamp")
-                df_ema["ema"] = df_ema["close"].ewm(
-                    span=ema_span,
-                    adjust=False,
-                ).mean()
+                df_ema["ema"] = df_ema["close"].ewm(span=ema_span, adjust=False).mean()
 
                 ema_row = df_ema[df_ema["timestamp"] <= t].tail(1)
                 if not ema_row.empty and not pd.isna(ema_row["ema"].iloc[0]):
@@ -239,11 +249,9 @@ class OkxExchange(IExchange):
                     "ema": ema_val,
                 }
 
-            # Avanzar "since" para la próxima llamada
             if last_bar_ts is not None:
                 current_from = int(last_bar_ts.timestamp() * 1000) + 1
 
-            # Esperar un poco antes de la próxima consulta
             time.sleep(step_secs / 2)
 
     # ------------------------- create_position -----------------------
@@ -286,9 +294,7 @@ class OkxExchange(IExchange):
             open_time=now,
         )
 
-        # SL / TP reales (2 órdenes "reduce only")
         self._submit_sl_tp(symbol, side, size, sl, tp)
-
         return pos_id
 
     def _submit_sl_tp(self, symbol: str, side: str, size: float, sl: float, tp: float):
@@ -313,7 +319,7 @@ class OkxExchange(IExchange):
             tdMode="cross",
             side=tp_side,
             ordType="trigger",
-            sz=str(size),
+            sz=str(tp),
             triggerPx=str(tp),
             reduceOnly=True,
         )
@@ -331,7 +337,6 @@ class OkxExchange(IExchange):
 
         inst = pos.symbol.replace("/", "-")
 
-        # Cancelar órdenes reduceOnly previas
         existing = self.trade.get_order_list(instId=inst)
         if "data" in existing:
             for o in existing["data"]:

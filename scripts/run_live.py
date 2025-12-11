@@ -8,12 +8,11 @@ import json
 import base64
 import hashlib
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Any, List
 
 import httpx
 import pandas as pd
 import app.ta.environment
-
 
 # ----------------------------------------------------------------------
 # Imports GREEN V3
@@ -23,14 +22,13 @@ from app.green.core import GreenV3Core, GreenStages
 from app.green.styles import get_style
 from app.green.pipeline.impulse import DefaultImpulseStrategy
 from app.green.pipeline.pullback import DefaultPullbackStrategy
-from app.green.pipeline.trigger import DefaultTriggerStrategy
-from app.green.pipeline.entry import DefaultEntryStrategy
+from app.green.pipeline.trigger_ai import DefaultTriggerAIStrategy
 from app.green.pipeline.position import DefaultPositionStrategy
 from app.exchange.okx import OkxExchange
 
 
 # ----------------------------------------------------------------------
-# Cliente HTTP mínimo de OKX para velas
+# Cliente HTTP mínimo de OKX para velas (histórico para el core)
 # ----------------------------------------------------------------------
 
 class OkxClient:
@@ -60,7 +58,7 @@ class OkxClient:
             "OK-ACCESS-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json",
         }
-        if os.getenv("OKX_SIMULATED", "0") == "1":
+        if os.getenv("OKX_ISPAPER", "0") == "1":
             headers["x-simulated-trading"] = "1"
         return headers
 
@@ -100,7 +98,6 @@ class OkxClient:
         )
         return df
 
-
 OKX_INST_IDS = {
     "BTC/USDT": "BTC-USDT-SWAP",
     "ETH/USDT": "ETH-USDT-SWAP",
@@ -127,11 +124,12 @@ def log(msg: str):
 
 def build_dfs_for_symbol(okx: OkxClient, inst_id: str, style) -> Dict[str, pd.DataFrame]:
     dfs: Dict[str, pd.DataFrame] = {}
+
     needed_tfs = {
         style.impulse_tf,
         style.pullback_tf,
-        style.trigger_tf,
-        style.entry_tf,
+        getattr(style, "trigger_tf", style.pullback_tf),
+        getattr(style, "entry_tf", style.pullback_tf),
         style.position_price_tf,
         style.position_ema_tf,
     }
@@ -153,7 +151,27 @@ def build_dfs_for_symbol(okx: OkxClient, inst_id: str, style) -> Dict[str, pd.Da
     return dfs
 
 
+def _append_live_trade_log(symbol: str, style_name: str, trade_row: Dict[str, Any]):
+    """
+    Log simple a CSV de los trades detectados por el core (entry/SL/TP/RR planificado).
+    No depende de cómo termine la posición, es solo lo que se decidió abrir.
+    """
+    out_dir = os.getenv("GREEN_LIVE_LOG_DIR", "live_logs")
+    os.makedirs(out_dir, exist_ok=True)
+    sym_clean = symbol.replace("/", "")
+
+    path = os.path.join(out_dir, f"live_trades_{sym_clean}_{style_name}.csv")
+
+    df = pd.DataFrame([trade_row])
+
+    if not os.path.exists(path):
+        df.to_csv(path, index=False)
+    else:
+        df.to_csv(path, index=False, mode="a", header=False)
+
+
 def main(ai_supervisor: bool = False):
+    # ai_supervisor lo reutilizamos como "usar IA para decidir entry"
     style_name = os.getenv("GREEN_STYLE", "DAY").upper()
     style = get_style(style_name)
 
@@ -169,21 +187,20 @@ def main(ai_supervisor: bool = False):
 
     log(f"GREEN V3 LIVE – style={style.name}, poll={poll_seconds}s")
     log(f"Símbolos configurados: {symbols}")
+    log(f"TriggerAI {'ACTIVADO' if ai_supervisor else 'DESACTIVADO'} (use_ai)")
 
     okx_client = OkxClient()
     exchange = OkxExchange()
 
     impulse_strategy = DefaultImpulseStrategy()
     pullback_strategy = DefaultPullbackStrategy()
-    trigger_strategy = DefaultTriggerStrategy()
-    entry_strategy = DefaultEntryStrategy(ai_supervisor=ai_supervisor)
+    trigger_ai_engine = DefaultTriggerAIStrategy(use_ai=ai_supervisor)
     position_strategy = DefaultPositionStrategy(exchange=exchange)
 
     stages = GreenStages(
         impulse=impulse_strategy,
         pullback=pullback_strategy,
-        trigger=trigger_strategy,
-        entry=entry_strategy,
+        trigger_ai=trigger_ai_engine,
         position=position_strategy,
     )
 
@@ -209,7 +226,7 @@ def main(ai_supervisor: bool = False):
                 trades = core.run(
                     symbol=sym,
                     dfs=dfs,
-                    cfg=cfg,
+                    cfg=cfg
                 )
             except Exception as e:
                 log(f"[{sym}] Error en GreenV3Core.run(): {e}")
@@ -230,6 +247,8 @@ def main(ai_supervisor: bool = False):
                         "result": t.result,
                         "rr_planned": t.rr_planned,
                         "rr_real": t.rr_real,
+                        "impulse_start": t.impulse_start,
+                        "trigger_time": t.trigger_time,
                     }
                     for t in trades
                 ]
@@ -254,8 +273,18 @@ def main(ai_supervisor: bool = False):
                 f"rr_plan={last_trade['rr_planned']:.2f}"
             )
 
-            # En esta versión la gestión real (órdenes) ya vive en PositionStrategy
-            # + OkxExchange. Si live_position_size > 0, se mandan órdenes reales.
+            # Log a CSV del trade detectado
+            _append_live_trade_log(
+                symbol=sym,
+                style_name=style.name,
+                trade_row={
+                    "timestamp_detected": datetime.utcnow().isoformat(),
+                    **last_trade.to_dict(),
+                },
+            )
+
+            # La gestión real (órdenes) ya vive en PositionStrategy + OkxExchange.
+            # Si cfg.position_size > 0, DefaultPositionStrategy crea la posición real.
 
         log(f"Sleeping {poll_seconds} segundos...\n")
         time.sleep(poll_seconds)
@@ -268,7 +297,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ai",
         action="store_true",
-        help="Usar supervisor IA para validar setups antes de ejecutar órdenes",
+        help="Usar IA (TriggerAI) para decidir si operar el pullback y calcular entry/SL/TP.",
     )
     args = parser.parse_args()
 

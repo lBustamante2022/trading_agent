@@ -64,6 +64,7 @@ class GreenStyle:
     pullback_min_hours: float          # duración mínima del pullback (horas)
     pullback_max_days: float           # ventana máxima tras el impulso (días)
     pullback_slow_body_factor: float
+    pullback_rebound_body_min_ratio: float
 
     # -----------------------------
     # Trigger
@@ -107,16 +108,17 @@ DAY_STYLE = GreenStyle(
     position_ema_tf="5m",
    
     # Impulse / SR
-    impulse_sr_price_tol_pct=0.01,  
+    impulse_sr_price_tol_pct=0.005,  
     impulse_sr_min_touches=3,
-    impulse_min_body_pct=0.05,     
-    impulse_break_pct=0.01,         
+    impulse_min_body_pct=0.03,     
+    impulse_break_pct=0.005,         
 
     # Pullback
     pullback_sr_tolerance=0.005,   
     pullback_min_hours=24.0,       
     pullback_max_days=10.0,        
-    pullback_slow_body_factor=0.6,
+    pullback_slow_body_factor=0.3,
+    pullback_rebound_body_min_ratio= 0.3,
 
     # Trigger
     trigger_sr_tolerance=0.005,
@@ -156,13 +158,14 @@ SCALPING_STYLE = GreenStyle(
     impulse_sr_price_tol_pct=0.005,  # 1% para agrupar SR en intradía
     impulse_sr_min_touches=3,
     impulse_min_body_pct=0.03,      # 8% de cuerpo para que realmente sea un “impulso”
-    impulse_break_pct=0.015,         # ruptura un poco más fuerte (~1.5%)
+    impulse_break_pct=0.005,         # ruptura un poco más fuerte (~1.5%)
 
     # Pullback
-    pullback_sr_tolerance=0.005,    # un poco más cerca del SR
-    pullback_min_hours=2,           # pullback mínimo ~2h
-    pullback_max_days=1.0,          # ventana corta desde el impulso (intradía / 2 días)
-    pullback_slow_body_factor=0.6,
+    pullback_sr_tolerance=0.015,    # un poco más cerca del SR
+    pullback_min_hours=1,           # pullback mínimo ~2h
+    pullback_max_days=5.0,          # ventana corta desde el impulso (intradía / 2 días)
+    pullback_slow_body_factor=0.4,
+    pullback_rebound_body_min_ratio= 0.6,
 
     # Trigger
     trigger_sr_tolerance=0.01,
@@ -181,7 +184,7 @@ SCALPING_STYLE = GreenStyle(
     position_ema_trail_buffer_pct=0.0015,
     position_ema_trail_lookback_bars=50,
     position_size = 5.0,
-    max_holding_minutes=24 * 60,  
+    max_holding_minutes=32 * 60,  
     position_ema_trail_span= 50   
 )
 
@@ -211,6 +214,7 @@ SWING_STYLE = GreenStyle(
     pullback_min_hours=24.0,       # pullback mínimo ~1 día
     pullback_max_days=30.0,        # ventana más larga
     pullback_slow_body_factor=0.6,
+    pullback_rebound_body_min_ratio= 0.3,
 
     # Trigger
     trigger_sr_tolerance=0.05,
